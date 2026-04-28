@@ -565,9 +565,10 @@ def create_access_token(data: dict):
 def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: int = payload.get("sub")
-        if user_id is None:
+        sub = payload.get("sub")
+        if sub is None:
             raise HTTPException(status_code=401, detail="Invalid authentication")
+        user_id: int = int(sub)
         return user_id
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -709,7 +710,7 @@ async def register(user: UserCreate):
             (user.email, password_hash))
         user_id = c.fetchone()[0]
         conn.commit()
-        access_token = create_access_token(data={"sub": user_id})
+        access_token = create_access_token(data={"sub": str(user_id)})
         return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/auth/login", response_model=Token)
@@ -720,7 +721,7 @@ async def login(user: UserLogin):
         result = c.fetchone()
         if not result or not verify_password(user.password, result[1]):
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        access_token = create_access_token(data={"sub": result[0]})
+        access_token = create_access_token(data={"sub": str(result[0])})
         return {"access_token": access_token, "token_type": "bearer"}
 
 @app.delete("/account")

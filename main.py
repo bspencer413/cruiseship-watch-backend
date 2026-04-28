@@ -13,6 +13,7 @@ import schedule
 import threading
 import time
 import re
+import html as html_lib
 import httpx
 import urllib.request
 import urllib.parse
@@ -29,6 +30,8 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@cruiseship.watch")
 
+VERSION = "0.1.1"
+
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError(
@@ -38,6 +41,232 @@ if not DATABASE_URL:
 # Render sometimes uses postgres:// (legacy). psycopg2 accepts both, but normalize for safety.
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# ── Region taxonomy ───────────────────────────────────────────────────────────
+# Canonical buckets: Caribbean, Mediterranean, Northern Europe, North America,
+# Central America, South America, Asia, Oceania, Middle East, Africa, Arctic.
+# ISO 3166-1 alpha-2 codes mapped to the cruise region most relevant for itinerary alerts.
+
+COUNTRY_TO_REGION = {
+    # Caribbean
+    "AI": "Caribbean", "AG": "Caribbean", "AW": "Caribbean", "BS": "Caribbean",
+    "BB": "Caribbean", "BQ": "Caribbean", "VG": "Caribbean", "KY": "Caribbean",
+    "CU": "Caribbean", "CW": "Caribbean", "DM": "Caribbean", "DO": "Caribbean",
+    "GD": "Caribbean", "GP": "Caribbean", "HT": "Caribbean", "JM": "Caribbean",
+    "MQ": "Caribbean", "MS": "Caribbean", "PR": "Caribbean", "BL": "Caribbean",
+    "KN": "Caribbean", "LC": "Caribbean", "MF": "Caribbean", "VC": "Caribbean",
+    "SX": "Caribbean", "TT": "Caribbean", "TC": "Caribbean", "VI": "Caribbean",
+
+    # Central America (Mexico grouped here for cruise itinerary purposes)
+    "BZ": "Central America", "CR": "Central America", "SV": "Central America",
+    "GT": "Central America", "HN": "Central America", "NI": "Central America",
+    "PA": "Central America", "MX": "Central America",
+
+    # North America
+    "US": "North America", "CA": "North America", "BM": "North America",
+
+    # South America
+    "AR": "South America", "BO": "South America", "BR": "South America",
+    "CL": "South America", "CO": "South America", "EC": "South America",
+    "GY": "South America", "PY": "South America", "PE": "South America",
+    "SR": "South America", "UY": "South America", "VE": "South America",
+    "FK": "South America", "GF": "South America",
+
+    # Mediterranean (incl. Iberian Atlantic and North Africa Med coast)
+    "ES": "Mediterranean", "FR": "Mediterranean", "IT": "Mediterranean",
+    "GR": "Mediterranean", "TR": "Mediterranean", "HR": "Mediterranean",
+    "MT": "Mediterranean", "CY": "Mediterranean", "MC": "Mediterranean",
+    "AL": "Mediterranean", "ME": "Mediterranean", "SI": "Mediterranean",
+    "BA": "Mediterranean", "TN": "Mediterranean", "DZ": "Mediterranean",
+    "MA": "Mediterranean", "LY": "Mediterranean", "EG": "Mediterranean",
+    "IL": "Mediterranean", "LB": "Mediterranean", "PT": "Mediterranean",
+    "GI": "Mediterranean", "VA": "Mediterranean", "SM": "Mediterranean",
+    "AD": "Mediterranean",
+
+    # Northern Europe (incl. British Isles, Baltic, Scandinavia)
+    "GB": "Northern Europe", "IE": "Northern Europe", "IS": "Northern Europe",
+    "NO": "Northern Europe", "SE": "Northern Europe", "FI": "Northern Europe",
+    "DK": "Northern Europe", "DE": "Northern Europe", "NL": "Northern Europe",
+    "BE": "Northern Europe", "EE": "Northern Europe", "LV": "Northern Europe",
+    "LT": "Northern Europe", "PL": "Northern Europe", "RU": "Northern Europe",
+    "FO": "Northern Europe", "JE": "Northern Europe", "GG": "Northern Europe",
+    "IM": "Northern Europe", "LU": "Northern Europe",
+
+    # Asia
+    "JP": "Asia", "KR": "Asia", "KP": "Asia", "CN": "Asia", "TW": "Asia",
+    "HK": "Asia", "MO": "Asia", "VN": "Asia", "TH": "Asia", "MY": "Asia",
+    "SG": "Asia", "ID": "Asia", "PH": "Asia", "BN": "Asia", "KH": "Asia",
+    "MM": "Asia", "LA": "Asia", "IN": "Asia", "LK": "Asia", "BD": "Asia",
+    "MV": "Asia", "PK": "Asia",
+
+    # Oceania (incl. South Pacific)
+    "AU": "Oceania", "NZ": "Oceania", "FJ": "Oceania", "PG": "Oceania",
+    "SB": "Oceania", "VU": "Oceania", "NC": "Oceania", "PF": "Oceania",
+    "WS": "Oceania", "TO": "Oceania", "KI": "Oceania", "TV": "Oceania",
+    "NR": "Oceania", "PW": "Oceania", "FM": "Oceania", "MH": "Oceania",
+    "CK": "Oceania", "NU": "Oceania",
+
+    # Middle East
+    "AE": "Middle East", "BH": "Middle East", "KW": "Middle East",
+    "OM": "Middle East", "QA": "Middle East", "SA": "Middle East",
+    "YE": "Middle East", "JO": "Middle East", "IR": "Middle East",
+    "IQ": "Middle East", "SY": "Middle East",
+
+    # Africa
+    "ZA": "Africa", "MZ": "Africa", "TZ": "Africa", "KE": "Africa",
+    "MG": "Africa", "MU": "Africa", "SC": "Africa", "RE": "Africa",
+    "NA": "Africa", "AO": "Africa", "GH": "Africa", "SN": "Africa",
+    "CV": "Africa", "GM": "Africa", "DJ": "Africa", "ER": "Africa",
+    "SO": "Africa", "NG": "Africa", "CI": "Africa", "CM": "Africa",
+    "GA": "Africa", "CG": "Africa", "CD": "Africa",
+
+    # Arctic / Antarctic (treated as one polar bucket)
+    "GL": "Arctic", "SJ": "Arctic", "AQ": "Arctic",
+}
+
+CANONICAL_REGIONS = {
+    "Caribbean", "Mediterranean", "Northern Europe", "North America",
+    "Central America", "South America", "Asia", "Oceania",
+    "Middle East", "Africa", "Arctic",
+}
+
+# Common user-facing labels and shortcuts → canonical bucket.
+# Lookup is case-insensitive; the keys here are stored lowercase.
+REGION_ALIASES = {
+    # Caribbean
+    "caribbean": "Caribbean",
+    "carib": "Caribbean",
+    "the caribbean": "Caribbean",
+    "bahamas": "Caribbean",
+    "eastern caribbean": "Caribbean",
+    "western caribbean": "Caribbean",
+    "southern caribbean": "Caribbean",
+
+    # Mediterranean
+    "mediterranean": "Mediterranean",
+    "med": "Mediterranean",
+    "the med": "Mediterranean",
+    "western mediterranean": "Mediterranean",
+    "eastern mediterranean": "Mediterranean",
+    "greek isles": "Mediterranean",
+    "greek islands": "Mediterranean",
+    "adriatic": "Mediterranean",
+
+    # Northern Europe
+    "northern europe": "Northern Europe",
+    "north europe": "Northern Europe",
+    "baltic": "Northern Europe",
+    "baltics": "Northern Europe",
+    "british isles": "Northern Europe",
+    "british": "Northern Europe",
+    "uk": "Northern Europe",
+    "norway": "Northern Europe",
+    "norwegian fjords": "Northern Europe",
+    "fjords": "Northern Europe",
+    "scandinavia": "Northern Europe",
+    "iceland": "Northern Europe",
+    "europe": "Northern Europe",
+
+    # North America
+    "north america": "North America",
+    "alaska": "North America",
+    "alaska/pnw": "North America",
+    "pacific northwest": "North America",
+    "pnw": "North America",
+    "hawaii": "North America",
+    "new england": "North America",
+    "canada": "North America",
+    "canada/new england": "North America",
+    "bermuda": "North America",
+
+    # Central America
+    "central america": "Central America",
+    "panama canal": "Central America",
+    "panama": "Central America",
+    "mexico": "Central America",
+    "mexican riviera": "Central America",
+    "riviera maya": "Central America",
+
+    # South America
+    "south america": "South America",
+    "amazon": "South America",
+    "patagonia": "South America",
+    "cape horn": "South America",
+
+    # Asia
+    "asia": "Asia",
+    "far east": "Asia",
+    "southeast asia": "Asia",
+    "south east asia": "Asia",
+    "se asia": "Asia",
+    "japan": "Asia",
+    "china": "Asia",
+    "india": "Asia",
+    "vietnam": "Asia",
+    "singapore": "Asia",
+    "thailand": "Asia",
+
+    # Oceania
+    "oceania": "Oceania",
+    "south pacific": "Oceania",
+    "pacific": "Oceania",
+    "australia": "Oceania",
+    "australia/nz": "Oceania",
+    "new zealand": "Oceania",
+    "tahiti": "Oceania",
+    "fiji": "Oceania",
+    "polynesia": "Oceania",
+
+    # Middle East
+    "middle east": "Middle East",
+    "persian gulf": "Middle East",
+    "arabian gulf": "Middle East",
+    "arabian peninsula": "Middle East",
+    "red sea": "Middle East",
+    "dubai": "Middle East",
+
+    # Africa
+    "africa": "Africa",
+    "east africa": "Africa",
+    "west africa": "Africa",
+    "south africa": "Africa",
+    "indian ocean": "Africa",
+
+    # Arctic / Antarctic
+    "arctic": "Arctic",
+    "antarctic": "Arctic",
+    "antarctica": "Arctic",
+    "polar": "Arctic",
+    "north pole": "Arctic",
+    "south pole": "Arctic",
+}
+
+
+def normalize_region_label(value: Optional[str]) -> Optional[str]:
+    """Map user-typed region label to a canonical bucket. Returns None if unrecognized."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # Exact canonical match first (case-sensitive shortcut)
+    if s in CANONICAL_REGIONS:
+        return s
+    key = s.lower()
+    if key in REGION_ALIASES:
+        return REGION_ALIASES[key]
+    # Loose substring match against canonical bucket names
+    for bucket in CANONICAL_REGIONS:
+        if bucket.lower() == key:
+            return bucket
+    return None
+
+
+def get_region_for_country(country_code: Optional[str]) -> Optional[str]:
+    if not country_code:
+        return None
+    return COUNTRY_TO_REGION.get(country_code.strip().upper())
+
 
 # ── Google BigQuery (SSDI — kept for cross-vertical compatibility) ─────────────
 
@@ -117,6 +346,7 @@ def parse_bq_results(rows: list) -> list:
             "source": "SSA Death Master File"
         })
     return results
+
 
 # ── Shared SSDI query logic (used by both /ssdi/search and /ssdi/proxy) ────────
 
@@ -225,7 +455,7 @@ def init_db():
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
         watchlist_id INTEGER NOT NULL,
-        obituary_id INTEGER NOT NULL,
+        obituary_id INTEGER,
         message TEXT NOT NULL,
         sent BOOLEAN DEFAULT FALSE,
         email_sent BOOLEAN DEFAULT FALSE,
@@ -245,6 +475,8 @@ def init_db():
         source TEXT DEFAULT 'SSDI',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
+
+    # ── Existing v0.1.0 column migrations ─────────────────────────────────────
     c.execute("ALTER TABLE obituaries ADD COLUMN IF NOT EXISTS name_normalized TEXT")
     c.execute("ALTER TABLE obituaries ADD COLUMN IF NOT EXISTS obit_text TEXT")
     c.execute("ALTER TABLE obituaries ADD COLUMN IF NOT EXISTS link TEXT")
@@ -257,8 +489,78 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_obituaries_name ON obituaries (name)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_obituaries_name_normalized ON obituaries (name_normalized)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_death_records_last_name ON death_records (last_name)")
+
+    # ── v0.1.1 schema additions ───────────────────────────────────────────────
+    # Watchlist: ship-shaped fields
+    c.execute("ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS region TEXT")
+    c.execute("ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS cruise_line TEXT")
+    c.execute("ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS year_built TEXT")
+    c.execute("ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS ship_type TEXT")
+    # Backfill region from legacy `location`, year_built from legacy `dob`
+    c.execute("UPDATE watchlist SET region = location WHERE region IS NULL AND location IS NOT NULL AND location <> ''")
+    c.execute("UPDATE watchlist SET year_built = dob WHERE year_built IS NULL AND dob IS NOT NULL AND dob <> ''")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_region ON watchlist (region)")
+
+    # Notifications: relax obituary_id, add polymorphic source pointers
+    try:
+        c.execute("ALTER TABLE notifications ALTER COLUMN obituary_id DROP NOT NULL")
+    except Exception as _e:
+        # Already nullable, or older Postgres without the constraint to drop — safe to ignore.
+        conn.rollback()
+        c = conn.cursor()
+    c.execute("ALTER TABLE notifications ADD COLUMN IF NOT EXISTS source_type TEXT")
+    c.execute("ALTER TABLE notifications ADD COLUMN IF NOT EXISTS source_ref_id INTEGER")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_notifications_source ON notifications (source_type, source_ref_id)")
+
+    # Inspections (CDC VSP Green Sheet) — schema only in v0.1.1, scraper lands v0.1.2
+    c.execute("""CREATE TABLE IF NOT EXISTS inspections (
+        id SERIAL PRIMARY KEY,
+        ship_name TEXT NOT NULL,
+        inspection_date TEXT,
+        score INTEGER,
+        report_url TEXT,
+        violations_summary TEXT,
+        fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_inspections_ship ON inspections (ship_name)")
+
+    # Outbreaks (CDC VSP) — schema only in v0.1.1, scraper lands v0.1.3
+    c.execute("""CREATE TABLE IF NOT EXISTS outbreaks (
+        id SERIAL PRIMARY KEY,
+        ship_name TEXT NOT NULL,
+        month TEXT,
+        year TEXT,
+        cruise_line TEXT,
+        agent TEXT,
+        pax_ill INTEGER,
+        pax_total INTEGER,
+        crew_ill INTEGER,
+        crew_total INTEGER,
+        report_url TEXT,
+        fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_outbreaks_ship ON outbreaks (ship_name)")
+
+    # Advisories (State Dept) — active in v0.1.1
+    c.execute("""CREATE TABLE IF NOT EXISTS advisories (
+        id SERIAL PRIMARY KEY,
+        country_code TEXT UNIQUE NOT NULL,
+        country_name TEXT,
+        region TEXT,
+        level INTEGER,
+        title TEXT,
+        summary TEXT,
+        url TEXT,
+        published TEXT,
+        updated TEXT,
+        fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_advisories_region ON advisories (region)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_advisories_level ON advisories (level)")
+
     conn.commit()
     conn.close()
+
 
 @contextmanager
 def get_db():
@@ -269,6 +571,7 @@ def get_db():
     finally:
         conn.close()
 
+
 def normalize_name(name: str) -> str:
     if not name:
         return name
@@ -278,6 +581,7 @@ def normalize_name(name: str) -> str:
         name = parts[1].strip() + " " + parts[0].strip()
     name = re.sub(r"\b\w+'\w+\b", lambda m: m.group(0).title(), name)
     return name.title()
+
 
 def send_email_notification(to_email: str, watchlist_name: str, obit_name: str, obit_location: str, obit_link: str):
     if not RESEND_API_KEY:
@@ -314,6 +618,58 @@ def send_email_notification(to_email: str, watchlist_name: str, obit_name: str, 
     except Exception as e:
         print("Email error: " + str(e))
         return False
+
+
+def send_advisory_email(to_email: str, ship_name: str, region: str, country_name: str,
+                        level: int, title: str, summary: str, url: str):
+    """Resend template for State Dept travel advisory alerts."""
+    if not RESEND_API_KEY:
+        print("Email not configured - skipping advisory email to " + to_email)
+        return False
+    try:
+        # State Dept summaries are HTML. Strip tags for the snippet, keep first ~400 chars.
+        plain = re.sub(r"<[^>]+>", " ", summary or "")
+        plain = html_lib.unescape(plain)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        if len(plain) > 400:
+            plain = plain[:400].rsplit(" ", 1)[0] + "…"
+
+        level_label = "Level " + str(level) + " advisory"
+        link_text = '<p><a href="' + str(url) + '">Read full advisory at travel.state.gov</a></p>' if url else ""
+
+        html_content = (
+            '<div style="font-family: Georgia, serif; max-width: 600px; margin: 0 auto; padding: 20px;">'
+            '<h2 style="color: #0891b2;">Cruise Ship Watch — Travel Advisory</h2>'
+            '<p>The U.S. State Department has issued a <strong>' + level_label + '</strong> for '
+            '<strong>' + (country_name or "this country") + '</strong>, in the <strong>' + region + '</strong> region.</p>'
+            '<p>You are watching <strong>' + ship_name + '</strong>, which sails this region.</p>'
+            '<p style="background:#fef3c7;padding:12px;border-left:4px solid #f59e0b;margin:16px 0;">'
+            '<strong>' + (title or "") + '</strong></p>'
+            '<p style="color:#374151;">' + plain + '</p>'
+            + link_text +
+            '<hr style="border: 1px solid #e5e7eb; margin: 20px 0;">'
+            '<p style="color: #6b7280; font-size: 12px;">'
+            'You are receiving this because <strong>' + ship_name + '</strong> is on your Cruise Ship Watch watchlist '
+            'and the State Department raised the advisory level for a country in its sailing region. '
+            'To manage your watchlist, visit <a href="https://cruiseship.watch">cruiseship.watch</a>.</p>'
+            '</div>'
+        )
+        response = httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": "Bearer " + RESEND_API_KEY, "Content-Type": "application/json"},
+            json={
+                "from": FROM_EMAIL,
+                "to": [to_email],
+                "subject": "Travel Advisory (Level " + str(level) + "): " + (country_name or "Region update") + " — " + ship_name,
+                "html": html_content
+            },
+            timeout=10
+        )
+        return response.status_code == 200
+    except Exception as e:
+        print("Advisory email error: " + str(e))
+        return False
+
 
 def fetch_wiki_data(name: str) -> dict:
     params = urllib.parse.urlencode({
@@ -387,6 +743,7 @@ def fetch_wiki_data(name: str) -> dict:
         "birth_date": birth_date,
     }
 
+
 def normalize_name_for_wiki(name: str) -> str:
     words = name.strip().split()
     result = []
@@ -396,6 +753,7 @@ def normalize_name_for_wiki(name: str) -> str:
         else:
             result.append(word)
     return " ".join(result)
+
 
 def fetch_wiki_data_smart(name: str) -> dict:
     data = fetch_wiki_data(name)
@@ -436,6 +794,7 @@ def fetch_wiki_data_smart(name: str) -> dict:
     print("[wiki_smart] Could not resolve: " + name)
     return data
 
+
 def extract_full_death_date(data: dict) -> str:
     import re as _re
     month_names = "January|February|March|April|May|June|July|August|September|October|November|December"
@@ -462,6 +821,7 @@ def extract_full_death_date(data: dict) -> str:
         return str(death_date)
     return data.get("death_year_from_cat", "") or ""
 
+
 def is_deceased_from_wiki(data: dict) -> bool:
     extract = data.get("extract", "")
     description = data.get("description", "")
@@ -487,9 +847,226 @@ def is_deceased_from_wiki(data: dict) -> bool:
         return True
     return False
 
+
 def search_legacy_oneoff(name: str) -> list:
     """Legacy.com obituary search — kept from MW backend, will not match for ship names. Returns []."""
     return []
+
+
+# ── State Department travel advisories (v0.1.1) ───────────────────────────────
+
+STATE_API_URL = "https://cadataapi.state.gov/api/TravelAdvisories"
+
+
+def parse_advisory_level(title: str) -> int:
+    """Extract numeric advisory level from a State Dept title like 'Greenland - Level 2: ...'."""
+    if not title:
+        return 0
+    m = re.search(r"Level\s+([1-4])", title, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return 0
+    return 0
+
+
+def parse_country_name_from_title(title: str, country_code: str) -> str:
+    """Best-effort country name from advisory title. Falls back to country code."""
+    if not title:
+        return country_code or ""
+    # Pattern: "Greenland - Level 2: Exercise Increased Caution" -> "Greenland"
+    m = re.match(r"^([^-—–]+?)\s*[-—–]\s*Level", title, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Pattern: "Greenland Travel Advisory" -> "Greenland"
+    m = re.match(r"^(.+?)\s+Travel Advisory", title, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return country_code or ""
+
+
+def fetch_state_advisories() -> list:
+    """Fetch the full advisories feed from cadataapi.state.gov. Returns a list of raw entries."""
+    try:
+        req = urllib.request.Request(
+            STATE_API_URL,
+            headers={
+                "User-Agent": "CruiseShipWatch/1.0",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        data = json_lib.loads(raw)
+        # API returns a JSON array of advisory objects.
+        if isinstance(data, list):
+            return data
+        # Defensive: some shapes wrap the array under a key.
+        if isinstance(data, dict):
+            for k in ("value", "Value", "data", "items", "advisories"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    return v
+        print("[advisories] Unexpected response shape: " + str(type(data)))
+        return []
+    except Exception as e:
+        print("[advisories] Fetch error: " + str(e))
+        return []
+
+
+def upsert_advisory(conn, entry: dict) -> Optional[dict]:
+    """Upsert a single advisory entry. Returns dict {country_code, level, region, advisory_id, prev_level}
+    on success, None on skip/error."""
+    country_code = (entry.get("Category") or entry.get("category") or "").strip().upper()
+    if not country_code or len(country_code) > 5:
+        return None
+
+    title = entry.get("Title") or entry.get("title") or ""
+    summary = entry.get("Summary") or entry.get("summary") or ""
+    link = entry.get("Link") or entry.get("link") or ""
+    published = entry.get("Published") or entry.get("published") or ""
+    updated = entry.get("Updated") or entry.get("updated") or ""
+    level = parse_advisory_level(title)
+    country_name = parse_country_name_from_title(title, country_code)
+    region = get_region_for_country(country_code)
+
+    c = conn.cursor()
+    # Read prior level for change detection
+    c.execute("SELECT id, level FROM advisories WHERE country_code = %s", (country_code,))
+    prior = c.fetchone()
+    prev_level = prior[1] if prior else None
+
+    c.execute("""
+        INSERT INTO advisories (country_code, country_name, region, level, title, summary, url, published, updated, fetched_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (country_code) DO UPDATE SET
+            country_name = EXCLUDED.country_name,
+            region = EXCLUDED.region,
+            level = EXCLUDED.level,
+            title = EXCLUDED.title,
+            summary = EXCLUDED.summary,
+            url = EXCLUDED.url,
+            published = EXCLUDED.published,
+            updated = EXCLUDED.updated,
+            fetched_at = EXCLUDED.fetched_at
+        RETURNING id
+    """, (country_code, country_name, region, level, title, summary, link,
+          str(published), str(updated), datetime.utcnow()))
+    advisory_id = c.fetchone()[0]
+    return {
+        "country_code": country_code,
+        "country_name": country_name,
+        "region": region,
+        "level": level,
+        "title": title,
+        "summary": summary,
+        "url": link,
+        "advisory_id": advisory_id,
+        "prev_level": prev_level,
+    }
+
+
+def fire_advisory_alerts(conn, advisory: dict) -> int:
+    """For an advisory at level >= 3 with a known region, find watched ships in that region
+    and fire alerts (with 7-day dedup per (watchlist_id, advisory_id)). Returns number fired."""
+    if not advisory:
+        return 0
+    if (advisory.get("level") or 0) < 3:
+        return 0
+    region = advisory.get("region")
+    if not region:
+        return 0
+
+    advisory_id = advisory["advisory_id"]
+    country_code = advisory["country_code"]
+    country_name = advisory.get("country_name") or country_code
+    level = advisory["level"]
+    title = advisory.get("title") or ""
+    summary = advisory.get("summary") or ""
+    url = advisory.get("url") or ""
+
+    fired = 0
+    c = conn.cursor()
+    c.execute("""
+        SELECT w.id, w.user_id, w.name, u.email
+        FROM watchlist w
+        JOIN users u ON w.user_id = u.id
+        WHERE w.status = 'active' AND w.region = %s
+    """, (region,))
+    rows = c.fetchall()
+
+    cutoff = datetime.utcnow() - timedelta(days=7)
+
+    for watch_id, user_id, ship_name, user_email in rows:
+        # 7-day dedup: skip if we've already alerted for this advisory_id within the window.
+        c.execute("""
+            SELECT id FROM notifications
+            WHERE watchlist_id = %s
+              AND source_type = 'advisory'
+              AND source_ref_id = %s
+              AND created_at > %s
+            LIMIT 1
+        """, (watch_id, advisory_id, cutoff))
+        if c.fetchone():
+            continue
+
+        message = (
+            "Travel advisory (Level " + str(level) + ") for " + country_name +
+            " in " + region + " — affects " + ship_name + "."
+        )
+        c.execute("""
+            INSERT INTO notifications
+                (user_id, watchlist_id, obituary_id, message, email_sent, source_type, source_ref_id)
+            VALUES (%s, %s, NULL, %s, %s, 'advisory', %s)
+            RETURNING id
+        """, (user_id, watch_id, message, False, advisory_id))
+        notif_id = c.fetchone()[0]
+        conn.commit()
+        fired += 1
+
+        if user_email:
+            sent = send_advisory_email(
+                user_email, ship_name, region, country_name, level, title, summary, url
+            )
+            if sent:
+                c.execute("UPDATE notifications SET email_sent = TRUE WHERE id = %s", (notif_id,))
+                conn.commit()
+
+    if fired:
+        print("[advisories] Fired " + str(fired) + " alerts for " +
+              country_code + " (Level " + str(level) + ", " + region + ")")
+    return fired
+
+
+def check_state_advisories():
+    """Pull the State Dept advisories feed, upsert each entry, fire alerts for watched ships
+    in matching regions at level >= 3 with 7-day dedup."""
+    print("[" + str(datetime.now()) + "] Starting State Dept advisory check...")
+    entries = fetch_state_advisories()
+    if not entries:
+        print("[advisories] No entries returned. Skipping.")
+        return
+
+    upserted = 0
+    total_fired = 0
+    with get_db() as conn:
+        for entry in entries:
+            try:
+                result = upsert_advisory(conn, entry)
+                conn.commit()
+                if result:
+                    upserted += 1
+                    total_fired += fire_advisory_alerts(conn, result)
+            except Exception as e:
+                conn.rollback()
+                print("[advisories] Upsert error for entry: " + str(e))
+                continue
+    print("[" + str(datetime.now()) + "] Advisory check complete. "
+          + str(upserted) + " upserted, " + str(total_fired) + " alerts fired.")
+
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
 
 class UserCreate(BaseModel):
     email: EmailStr
@@ -505,6 +1082,13 @@ class Token(BaseModel):
 
 class WatchlistItem(BaseModel):
     name: str
+    # New v0.1.1 ship-shaped fields
+    region: Optional[str] = None
+    cruise_line: Optional[str] = None
+    year_built: Optional[str] = None
+    ship_type: Optional[str] = None
+    # Legacy v0.1.0 fields — accepted for back-compat. `location` is treated as region fallback,
+    # `dob` as year_built fallback.
     location: Optional[str] = None
     dob: Optional[str] = None
     is_deceased: Optional[bool] = False
@@ -513,8 +1097,12 @@ class WatchlistItem(BaseModel):
 class WatchlistResponse(BaseModel):
     id: int
     name: str
-    location: Optional[str]
-    dob: Optional[str]
+    location: Optional[str] = None
+    dob: Optional[str] = None
+    region: Optional[str] = None
+    cruise_line: Optional[str] = None
+    year_built: Optional[str] = None
+    ship_type: Optional[str] = None
     status: str
     created_at: str
     is_deceased: Optional[bool] = False
@@ -537,7 +1125,9 @@ class ObituaryResult(BaseModel):
     obit_text: Optional[str]
     confidence: str
 
-app = FastAPI(title="Cruise Ship Watch API", version="0.1.0")
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Cruise Ship Watch API", version=VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -548,6 +1138,7 @@ app.add_middleware(
 )
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -600,13 +1191,17 @@ def extract_location(text: str) -> Optional[str]:
         return match.group(1)
     return None
 
+
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "0.1.0"
+        "version": VERSION
     }
+
+
+# ── Admin endpoints ───────────────────────────────────────────────────────────
 
 @app.get("/admin/delete-user")
 async def admin_delete_user(email: str):
@@ -623,6 +1218,7 @@ async def admin_delete_user(email: str):
         conn.commit()
         return {"deleted": True, "email": email}
 
+
 @app.get("/admin/stats")
 async def get_stats():
     with get_db() as conn:
@@ -631,19 +1227,66 @@ async def get_stats():
         obit_count = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM death_records")
         death_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM advisories")
+        adv_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM advisories WHERE level >= 3")
+        adv_high = c.fetchone()[0]
         c.execute("SELECT name, date, source FROM obituaries ORDER BY scraped_at DESC LIMIT 5")
         recent = c.fetchall()
         return {
             "obituaries": obit_count,
             "death_records": death_count,
+            "advisories_total": adv_count,
+            "advisories_level_3_plus": adv_high,
             "most_recent": [{"name": r[0], "date": r[1], "source": r[2]} for r in recent],
             "scraping": "suspended"
         }
+
 
 @app.get("/admin/wiki-check-now")
 async def wiki_check_now():
     threading.Thread(target=check_wikipedia_watchlist, daemon=True).start()
     return {"message": "Wikipedia watchlist check started"}
+
+
+@app.get("/admin/advisory-check-now")
+async def advisory_check_now():
+    """Manually trigger a State Dept advisory pull + alert pass."""
+    threading.Thread(target=check_state_advisories, daemon=True).start()
+    return {"message": "State Dept advisory check started"}
+
+
+@app.get("/admin/advisories")
+async def admin_list_advisories(level_min: int = 0):
+    """List cached advisories filtered by minimum level."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT country_code, country_name, region, level, title, url, published, updated, fetched_at
+            FROM advisories
+            WHERE level >= %s
+            ORDER BY level DESC, country_name ASC
+        """, (level_min,))
+        rows = c.fetchall()
+        return {
+            "count": len(rows),
+            "level_min": level_min,
+            "advisories": [
+                {
+                    "country_code": r[0],
+                    "country_name": r[1],
+                    "region": r[2],
+                    "level": r[3],
+                    "title": r[4],
+                    "url": r[5],
+                    "published": r[6],
+                    "updated": r[7],
+                    "fetched_at": str(r[8]) if r[8] else None,
+                }
+                for r in rows
+            ],
+        }
+
 
 @app.get("/admin/test-refresh/{name}")
 async def test_refresh(name: str):
@@ -661,6 +1304,7 @@ async def test_refresh(name: str):
         }
     except Exception as e:
         return {"name": name, "wiki_ok": False, "error": str(e)}
+
 
 @app.get("/admin/test-ssdi/{name}")
 async def test_ssdi(name: str):
@@ -697,6 +1341,9 @@ async def test_ssdi(name: str):
     except Exception as e:
         return {"name": name, "bq_ok": False, "error": str(e)}
 
+
+# ── Auth endpoints ────────────────────────────────────────────────────────────
+
 @app.post("/auth/register", response_model=Token)
 async def register(user: UserCreate):
     with get_db() as conn:
@@ -713,6 +1360,7 @@ async def register(user: UserCreate):
         access_token = create_access_token(data={"sub": str(user_id)})
         return {"access_token": access_token, "token_type": "bearer"}
 
+
 @app.post("/auth/login", response_model=Token)
 async def login(user: UserLogin):
     with get_db() as conn:
@@ -724,6 +1372,7 @@ async def login(user: UserLogin):
         access_token = create_access_token(data={"sub": str(result[0])})
         return {"access_token": access_token, "token_type": "bearer"}
 
+
 @app.delete("/account")
 async def delete_account(user_id: int = Depends(get_current_user)):
     with get_db() as conn:
@@ -734,13 +1383,17 @@ async def delete_account(user_id: int = Depends(get_current_user)):
         conn.commit()
         return {"message": "Account permanently deleted"}
 
+
+# ── Watchlist endpoints ───────────────────────────────────────────────────────
+
 @app.get("/watchlist", response_model=List[WatchlistResponse])
 async def get_watchlist(user_id: int = Depends(get_current_user)):
     with get_db() as conn:
         c = conn.cursor()
         c.execute("""
             SELECT id, name, location, dob, status, created_at,
-                   is_deceased, wikipedia_description, death_year
+                   is_deceased, wikipedia_description, death_year,
+                   region, cruise_line, year_built, ship_type
             FROM watchlist
             WHERE user_id = %s AND status = 'active'
             ORDER BY created_at DESC
@@ -752,22 +1405,53 @@ async def get_watchlist(user_id: int = Depends(get_current_user)):
                 "dob": row[3], "status": row[4], "created_at": str(row[5]),
                 "is_deceased": row[6] or False,
                 "wikipedia_description": row[7],
-                "death_year": row[8]
+                "death_year": row[8],
+                "region": row[9],
+                "cruise_line": row[10],
+                "year_built": row[11],
+                "ship_type": row[12],
             })
         return items
 
+
 @app.post("/watchlist")
 async def add_to_watchlist(item: WatchlistItem, user_id: int = Depends(get_current_user)):
+    # Resolve region: prefer explicit region, fall back to legacy `location`. Normalize either.
+    raw_region = item.region if item.region else item.location
+    canonical_region = normalize_region_label(raw_region) or (raw_region or None)
+
+    # Resolve year_built: prefer explicit, fall back to legacy `dob`.
+    year_built = item.year_built if item.year_built else item.dob
+
+    # Keep `location` and `dob` populated for back-compat with v0.1.0 frontend reads.
+    location_value = item.location if item.location else canonical_region
+    dob_value = item.dob if item.dob else year_built
+
     with get_db() as conn:
         c = conn.cursor()
         c.execute("""
-            INSERT INTO watchlist (user_id, name, location, dob, is_deceased, death_year)
-            VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
-        """, (user_id, item.name, item.location, item.dob,
-                item.is_deceased or False, item.death_year or None))
+            INSERT INTO watchlist (
+                user_id, name, location, dob, is_deceased, death_year,
+                region, cruise_line, year_built, ship_type
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            user_id, item.name, location_value, dob_value,
+            item.is_deceased or False, item.death_year or None,
+            canonical_region, item.cruise_line, year_built, item.ship_type,
+        ))
         conn.commit()
         item_id = c.fetchone()[0]
-        return {"message": "Added to watchlist", "id": item_id}
+        return {
+            "message": "Added to watchlist",
+            "id": item_id,
+            "region": canonical_region,
+            "year_built": year_built,
+            "cruise_line": item.cruise_line,
+            "ship_type": item.ship_type,
+        }
+
 
 @app.delete("/watchlist/{item_id}")
 async def remove_from_watchlist(item_id: int, user_id: int = Depends(get_current_user)):
@@ -780,6 +1464,7 @@ async def remove_from_watchlist(item_id: int, user_id: int = Depends(get_current
         if c.rowcount == 0:
             raise HTTPException(status_code=404, detail="Item not found")
         return {"message": "Removed from watchlist"}
+
 
 @app.get("/watchlist/{item_id}/refresh")
 async def refresh_watchlist_item(item_id: int, user_id: int = Depends(get_current_user)):
@@ -870,8 +1555,9 @@ async def refresh_watchlist_item(item_id: int, user_id: int = Depends(get_curren
                 death_info = (" Retired: " + str(death_date)) if death_date else ""
                 message = "Update on " + watch_name + "." + death_info
                 c.execute("""
-                    INSERT INTO notifications (user_id, watchlist_id, obituary_id, message, email_sent)
-                    VALUES (%s, %s, 1, %s, %s)
+                    INSERT INTO notifications
+                        (user_id, watchlist_id, obituary_id, message, email_sent, source_type)
+                    VALUES (%s, %s, NULL, %s, %s, 'wikipedia')
                 """, (user_id, watch_id, message, False))
                 conn.commit()
                 if user_email:
@@ -900,6 +1586,64 @@ async def refresh_watchlist_item(item_id: int, user_id: int = Depends(get_curren
             "legacy_results": legacy_results
         }
 
+
+@app.get("/watchlist/{item_id}/advisories")
+async def get_watchlist_advisories(item_id: int, user_id: int = Depends(get_current_user)):
+    """Return cached State Dept advisories (level >= 2) for the ship's region."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, name, region, location
+            FROM watchlist
+            WHERE id = %s AND user_id = %s AND status = 'active'
+        """, (item_id, user_id))
+        row = c.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Watchlist item not found")
+        watch_id, watch_name, region, location_legacy = row
+        canonical = normalize_region_label(region) or normalize_region_label(location_legacy)
+
+        if not canonical:
+            return {
+                "watchlist_id": watch_id,
+                "ship_name": watch_name,
+                "region": region or location_legacy,
+                "canonical_region": None,
+                "advisories": [],
+                "note": "Region not recognized — no advisories returned."
+            }
+
+        c.execute("""
+            SELECT country_code, country_name, region, level, title, summary, url,
+                   published, updated, fetched_at
+            FROM advisories
+            WHERE region = %s AND level >= 2
+            ORDER BY level DESC, country_name ASC
+        """, (canonical,))
+        rows = c.fetchall()
+        return {
+            "watchlist_id": watch_id,
+            "ship_name": watch_name,
+            "region": region or location_legacy,
+            "canonical_region": canonical,
+            "advisories": [
+                {
+                    "country_code": r[0],
+                    "country_name": r[1],
+                    "region": r[2],
+                    "level": r[3],
+                    "title": r[4],
+                    "summary": r[5],
+                    "url": r[6],
+                    "published": r[7],
+                    "updated": r[8],
+                    "fetched_at": str(r[9]) if r[9] else None,
+                }
+                for r in rows
+            ],
+        }
+
+
 @app.delete("/notifications/{notif_id}")
 async def delete_notification(notif_id: int, user_id: int = Depends(get_current_user)):
     try:
@@ -911,6 +1655,9 @@ async def delete_notification(notif_id: int, user_id: int = Depends(get_current_
     except Exception as e:
         print("Delete notification error: " + str(e))
         return {"deleted": False}
+
+
+# ── SSDI / search endpoints (kept for cross-vertical compatibility) ────────────
 
 @app.get("/ssdi/search")
 async def ssdi_search(
@@ -924,6 +1671,7 @@ async def ssdi_search(
     """Authenticated SSDI search — kept for cross-vertical compatibility."""
     return run_ssdi_query(name, birth_year, middle_name, suffix, offset)
 
+
 @app.get("/ssdi/proxy")
 async def ssdi_proxy(
     name: str,
@@ -935,9 +1683,11 @@ async def ssdi_proxy(
     """Unauthenticated SSDI proxy — kept for cross-vertical compatibility."""
     return run_ssdi_query(name, birth_year, middle_name, suffix, offset)
 
+
 @app.get("/legacy/search")
 async def legacy_search(name: str, user_id: int = Depends(get_current_user)):
     return {"name": name, "results": [], "count": 0}
+
 
 @app.post("/search", response_model=List[ObituaryResult])
 async def search_obituaries(search: ObituarySearch):
@@ -971,13 +1721,14 @@ async def search_obituaries(search: ObituarySearch):
                 continue
         return results
 
+
 @app.get("/notifications")
 async def get_notifications(user_id: int = Depends(get_current_user)):
     with get_db() as conn:
         c = conn.cursor()
         c.execute("""
             SELECT n.id, n.message, n.created_at, w.name,
-                   COALESCE(o.link, '') as link, n.watchlist_id
+                   COALESCE(o.link, '') as link, n.watchlist_id, n.source_type
             FROM notifications n
             JOIN watchlist w ON n.watchlist_id = w.id
             LEFT JOIN obituaries o ON n.obituary_id = o.id
@@ -990,13 +1741,17 @@ async def get_notifications(user_id: int = Depends(get_current_user)):
                 "id": row[0], "name": row[3],
                 "message": row[1], "created_at": str(row[2]),
                 "link": row[4] or "",
-                "watchlist_id": row[5]
+                "watchlist_id": row[5],
+                "source_type": row[6] or "",
             })
         return notifications
 
+
+# ── Background watchlist refresh (Wikipedia path — kept from v0.1.0) ──────────
+
 def check_wikipedia_watchlist():
-    """Background watchlist refresh. Person-shaped checks in v0.1.0; will be replaced
-    with CDC VSP + State Dept advisory checks in a future version."""
+    """Background watchlist refresh. Person-shaped checks in v0.1.0; CDC VSP scrapers
+    will replace this for ships in v0.1.2 / v0.1.3."""
     print("[" + str(datetime.now()) + "] Starting Wikipedia watchlist check...")
     with get_db() as conn:
         c = conn.cursor()
@@ -1038,8 +1793,9 @@ def check_wikipedia_watchlist():
                         death_info = (" Retired: " + str(death_date)) if death_date else ""
                         message = "Update on " + watch_name + "." + death_info
                         c.execute("""
-                            INSERT INTO notifications (user_id, watchlist_id, obituary_id, message, email_sent)
-                            VALUES (%s, %s, 1, %s, %s)
+                            INSERT INTO notifications
+                                (user_id, watchlist_id, obituary_id, message, email_sent, source_type)
+                            VALUES (%s, %s, NULL, %s, %s, 'wikipedia')
                         """, (user_id, watch_id, message, False))
                         conn.commit()
                         notified += 1
@@ -1057,21 +1813,41 @@ def check_wikipedia_watchlist():
                 continue
     print("[" + str(datetime.now()) + "] Wikipedia check complete. " + str(updated) + " updated, " + str(notified) + " notified.")
 
+
+# ── 24hr cron — runs both State Dept advisories and Wikipedia checks ──────────
+
+def run_daily_cycle():
+    """The combined daily check. State Dept first (cheap, single API call),
+    then Wikipedia (per-watchlist sweeps)."""
+    try:
+        check_state_advisories()
+    except Exception as e:
+        print("[cron] check_state_advisories failed: " + str(e))
+    try:
+        check_wikipedia_watchlist()
+    except Exception as e:
+        print("[cron] check_wikipedia_watchlist failed: " + str(e))
+
+
 def run_scheduler():
-    schedule.every(6).hours.do(check_wikipedia_watchlist)
+    schedule.every(24).hours.do(run_daily_cycle)
     while True:
         schedule.run_pending()
         time.sleep(60)
 
+
 @app.on_event("startup")
 async def startup_event():
     init_db()
-    print("Database initialized")
+    print("Database initialized (CW v" + VERSION + ")")
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
-    print("Background scheduler started (wiki-check: 6hr)")
+    print("Background scheduler started (24hr cycle: state advisories + wiki check)")
+    threading.Thread(target=check_state_advisories, daemon=True).start()
+    print("Initial State Dept advisory check started")
     threading.Thread(target=check_wikipedia_watchlist, daemon=True).start()
     print("Initial Wikipedia watchlist check started")
+
 
 if __name__ == "__main__":
     import uvicorn

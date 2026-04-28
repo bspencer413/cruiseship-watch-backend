@@ -22,19 +22,24 @@ from contextlib import contextmanager
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "memorial-watch-secret-2026")
+# ── Config from environment ───────────────────────────────────────────────────
+SECRET_KEY = os.environ.get("JWT_SECRET", os.environ.get("SECRET_KEY", "cruiseship-watch-fallback-key"))
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-FROM_EMAIL = "alerts@memorywatch.app"
+FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@cruiseship.watch")
 
-DB_HOST = "dpg-d6qhp3ngi27c73a3ivag-a.oregon-postgres.render.com"
-DB_USER = "memorial_watch_db_user"
-DB_PASS = "9IkXRdY8NcZSKy0yw5b7viPdtIrVIITR"
-DB_NAME = "memorial_watch_db"
-DATABASE_URL = "postgresql://" + DB_USER + ":" + DB_PASS + "@" + DB_HOST + "/" + DB_NAME
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL environment variable not set. "
+        "In Render, link a Postgres database to this service, or set DATABASE_URL manually."
+    )
+# Render sometimes uses postgres:// (legacy). psycopg2 accepts both, but normalize for safety.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# ── Google BigQuery via google-cloud-bigquery library ──────────────────────────
+# ── Google BigQuery (SSDI — kept for cross-vertical compatibility) ─────────────
 
 def get_bq_client():
     """Create BigQuery client from service account JSON env var."""
@@ -283,15 +288,15 @@ def send_email_notification(to_email: str, watchlist_name: str, obit_name: str, 
         link_text = '<p><a href="' + str(obit_link) + '">Read more</a></p>' if obit_link else ""
         html_content = (
             '<div style="font-family: Georgia, serif; max-width: 600px; margin: 0 auto; padding: 20px;">'
-            '<h2 style="color: #7c3aed;">Memory Watch Alert</h2>'
-            '<p>We found a possible match for <strong>' + watchlist_name + '</strong> on your watchlist.</p>'
-            '<p><strong>Name:</strong> ' + obit_name + '</p>'
-            '<p><strong>Location:</strong> ' + location_text + '</p>'
+            '<h2 style="color: #0891b2;">Cruise Ship Watch Alert</h2>'
+            '<p>We found an update for <strong>' + watchlist_name + '</strong> on your watchlist.</p>'
+            '<p><strong>Ship:</strong> ' + obit_name + '</p>'
+            '<p><strong>Region:</strong> ' + location_text + '</p>'
             + link_text +
             '<hr style="border: 1px solid #e5e7eb; margin: 20px 0;">'
             '<p style="color: #6b7280; font-size: 12px;">You are receiving this because you added '
-            + watchlist_name + ' to your Memory Watch watchlist. '
-            'To manage your watchlist, visit <a href="https://memorywatch.app">memorywatch.app</a></p>'
+            + watchlist_name + ' to your Cruise Ship Watch watchlist. '
+            'To manage your watchlist, visit <a href="https://cruiseship.watch">cruiseship.watch</a></p>'
             '</div>'
         )
         response = httpx.post(
@@ -300,7 +305,7 @@ def send_email_notification(to_email: str, watchlist_name: str, obit_name: str, 
             json={
                 "from": FROM_EMAIL,
                 "to": [to_email],
-                "subject": "Memory Watch Alert: " + watchlist_name,
+                "subject": "Cruise Ship Watch Alert: " + watchlist_name,
                 "html": html_content
             },
             timeout=10
@@ -323,7 +328,7 @@ def fetch_wiki_data(name: str) -> dict:
         "format": "json"
     })
     url = "https://en.wikipedia.org/w/api.php?" + params
-    req = urllib.request.Request(url, headers={"User-Agent": "MemoryWatch/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "CruiseShipWatch/1.0"})
     with urllib.request.urlopen(req, timeout=15) as resp:
         data = json_lib.loads(resp.read().decode())
     pages = data.get("query", {}).get("pages", {})
@@ -359,7 +364,7 @@ def fetch_wiki_data(name: str) -> dict:
     death_date_summary = None
     try:
         sum_url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(title)
-        sum_req = urllib.request.Request(sum_url, headers={"User-Agent": "MemoryWatch/1.0"})
+        sum_req = urllib.request.Request(sum_url, headers={"User-Agent": "CruiseShipWatch/1.0"})
         with urllib.request.urlopen(sum_req, timeout=10) as sum_resp:
             sum_data = json_lib.loads(sum_resp.read().decode())
             thumb = sum_data.get("thumbnail")
@@ -402,7 +407,7 @@ def fetch_wiki_data_smart(name: str) -> dict:
     print("[wiki_smart] Resolving disambiguation for: " + name + " (last=" + last_name + ")")
     try:
         search_url = "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=" + urllib.parse.quote(name) + "&srlimit=8&format=json&origin=*"
-        req = urllib.request.Request(search_url, headers={"User-Agent": "MemoryWatch/1.0"})
+        req = urllib.request.Request(search_url, headers={"User-Agent": "CruiseShipWatch/1.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             search_data = json_lib.loads(resp.read().decode())
         results = search_data.get("query", {}).get("search", [])
@@ -483,73 +488,8 @@ def is_deceased_from_wiki(data: dict) -> bool:
     return False
 
 def search_legacy_oneoff(name: str) -> list:
-    results = []
-    try:
-        parts = name.strip().split()
-        first = parts[0] if parts else name
-        last = parts[-1] if len(parts) > 1 else ""
-        search_url = (
-            "https://www.legacy.com/obituaries/search?firstName=" +
-            urllib.parse.quote(first) +
-            "&lastName=" + urllib.parse.quote(last)
-        )
-        req = urllib.request.Request(search_url, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml",
-        })
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-            import re as _re
-            json_ld_matches = _re.findall(r'<script type="application/ld\+json">(.*?)</script>', html, _re.DOTALL)
-            for match in json_ld_matches[:5]:
-                try:
-                    obj = json_lib.loads(match)
-                    if isinstance(obj, list):
-                        for item in obj:
-                            if item.get("@type") in ["Person", "Obituary"]:
-                                results.append({
-                                    "name": item.get("name", name),
-                                    "date": item.get("deathDate", ""),
-                                    "location": item.get("address", {}).get("addressLocality", "") if isinstance(item.get("address"), dict) else "",
-                                    "link": item.get("url", search_url),
-                                    "obit_text": item.get("description", "")
-                                })
-                    elif isinstance(obj, dict) and obj.get("@type") in ["Person", "Obituary"]:
-                        results.append({
-                            "name": obj.get("name", name),
-                            "date": obj.get("deathDate", ""),
-                            "location": obj.get("address", {}).get("addressLocality", "") if isinstance(obj.get("address"), dict) else "",
-                            "link": obj.get("url", search_url),
-                            "obit_text": obj.get("description", "")
-                        })
-                except Exception:
-                    continue
-            if results:
-                print("Legacy direct search found " + str(len(results)) + " results for " + name)
-                return results[:5]
-    except Exception as e:
-        print("Legacy direct search error: " + str(e))
-    try:
-        normalized = normalize_name(name)
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT name, location, date, link, obit_text FROM obituaries WHERE name ILIKE %s OR name_normalized ILIKE %s ORDER BY scraped_at DESC LIMIT 5",
-                ("%" + name + "%", "%" + normalized + "%")
-            )
-            for row in c.fetchall():
-                results.append({
-                    "name": row[0] or name,
-                    "date": row[2] or "",
-                    "location": row[1] or "",
-                    "link": row[3] or "",
-                    "obit_text": row[4] or ""
-                })
-        if results:
-            print("Legacy DB fallback found " + str(len(results)) + " results for " + name)
-    except Exception as e:
-        print("Legacy DB fallback error: " + str(e))
-    return results
+    """Legacy.com obituary search — kept from MW backend, will not match for ship names. Returns []."""
+    return []
 
 class UserCreate(BaseModel):
     email: EmailStr
@@ -597,7 +537,7 @@ class ObituaryResult(BaseModel):
     obit_text: Optional[str]
     confidence: str
 
-app = FastAPI(title="Memory Watch API", version="1.5.20")
+app = FastAPI(title="Cruise Ship Watch API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -664,9 +604,9 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "1.5.20"
+        "version": "0.1.0"
     }
-    
+
 @app.get("/admin/delete-user")
 async def admin_delete_user(email: str):
     with get_db() as conn:
@@ -681,7 +621,7 @@ async def admin_delete_user(email: str):
         c.execute("DELETE FROM users WHERE id = %s", (user_id,))
         conn.commit()
         return {"deleted": True, "email": email}
-        
+
 @app.get("/admin/stats")
 async def get_stats():
     with get_db() as conn:
@@ -864,7 +804,7 @@ async def refresh_watchlist_item(item_id: int, user_id: int = Depends(get_curren
                 stored_death_full = stored[1]
                 try:
                     sum_url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(watch_name)
-                    sum_req = urllib.request.Request(sum_url, headers={"User-Agent": "MemoryWatch/1.0"})
+                    sum_req = urllib.request.Request(sum_url, headers={"User-Agent": "CruiseShipWatch/1.0"})
                     with urllib.request.urlopen(sum_req, timeout=10) as sum_resp:
                         sum_data = json_lib.loads(sum_resp.read().decode())
                     thumb = sum_data.get("thumbnail")
@@ -926,8 +866,8 @@ async def refresh_watchlist_item(item_id: int, user_id: int = Depends(get_curren
                 "SELECT id FROM notifications WHERE watchlist_id = %s AND message LIKE %s",
                 (watch_id, "%Wikipedia%"))
             if not c.fetchone():
-                death_info = (" Died: " + str(death_date)) if death_date else ""
-                message = "Wikipedia reports " + watch_name + " has passed away." + death_info
+                death_info = (" Retired: " + str(death_date)) if death_date else ""
+                message = "Update on " + watch_name + "." + death_info
                 c.execute("""
                     INSERT INTO notifications (user_id, watchlist_id, obituary_id, message, email_sent)
                     VALUES (%s, %s, 1, %s, %s)
@@ -980,7 +920,7 @@ async def ssdi_search(
     offset: int = 0,
     user_id: int = Depends(get_current_user)
 ):
-    """Authenticated SSDI search — for DORA and MW apps."""
+    """Authenticated SSDI search — kept for cross-vertical compatibility."""
     return run_ssdi_query(name, birth_year, middle_name, suffix, offset)
 
 @app.get("/ssdi/proxy")
@@ -991,7 +931,7 @@ async def ssdi_proxy(
     suffix: str = None,
     offset: int = 0
 ):
-    """Unauthenticated SSDI proxy — for NYT tester and future verticals."""
+    """Unauthenticated SSDI proxy — kept for cross-vertical compatibility."""
     return run_ssdi_query(name, birth_year, middle_name, suffix, offset)
 
 @app.get("/legacy/search")
@@ -1054,6 +994,8 @@ async def get_notifications(user_id: int = Depends(get_current_user)):
         return notifications
 
 def check_wikipedia_watchlist():
+    """Background watchlist refresh. Person-shaped checks in v0.1.0; will be replaced
+    with CDC VSP + State Dept advisory checks in a future version."""
     print("[" + str(datetime.now()) + "] Starting Wikipedia watchlist check...")
     with get_db() as conn:
         c = conn.cursor()
@@ -1092,8 +1034,8 @@ def check_wikipedia_watchlist():
                         "SELECT id FROM notifications WHERE watchlist_id = %s AND message LIKE %s",
                         (watch_id, "%Wikipedia%"))
                     if not c.fetchone():
-                        death_info = (" Died: " + str(death_date)) if death_date else ""
-                        message = "Wikipedia reports " + watch_name + " has passed away." + death_info
+                        death_info = (" Retired: " + str(death_date)) if death_date else ""
+                        message = "Update on " + watch_name + "." + death_info
                         c.execute("""
                             INSERT INTO notifications (user_id, watchlist_id, obituary_id, message, email_sent)
                             VALUES (%s, %s, 1, %s, %s)
@@ -1126,7 +1068,7 @@ async def startup_event():
     print("Database initialized")
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
-    print("Background scheduler started (wiki-check: 6hr, scraping: suspended)")
+    print("Background scheduler started (wiki-check: 6hr)")
     threading.Thread(target=check_wikipedia_watchlist, daemon=True).start()
     print("Initial Wikipedia watchlist check started")
 

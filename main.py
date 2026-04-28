@@ -571,7 +571,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         return user_id
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
+    except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def calculate_confidence(search_name, found_name, search_loc, found_loc):

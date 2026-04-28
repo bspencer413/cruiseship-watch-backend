@@ -10,3 +10,4 @@ pydantic[email]
 requests
 google-cloud-bigquery
 PyJWT
+schedule

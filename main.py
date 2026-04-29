@@ -30,7 +30,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@cruiseship.watch")
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -48,80 +48,255 @@ if DATABASE_URL.startswith("postgres://"):
 # ISO 3166-1 alpha-2 codes mapped to the cruise region most relevant for itinerary alerts.
 
 COUNTRY_TO_REGION = {
+    # State Dept uses FIPS-style country codes, not ISO-3166.
+    # Mapping below covers all advisory countries observed in /admin/advisories.
+
     # Caribbean
-    "AI": "Caribbean", "AG": "Caribbean", "AW": "Caribbean", "BS": "Caribbean",
-    "BB": "Caribbean", "BQ": "Caribbean", "VG": "Caribbean", "KY": "Caribbean",
-    "CU": "Caribbean", "CW": "Caribbean", "DM": "Caribbean", "DO": "Caribbean",
-    "GD": "Caribbean", "GP": "Caribbean", "HT": "Caribbean", "JM": "Caribbean",
-    "MQ": "Caribbean", "MS": "Caribbean", "PR": "Caribbean", "BL": "Caribbean",
-    "KN": "Caribbean", "LC": "Caribbean", "MF": "Caribbean", "VC": "Caribbean",
-    "SX": "Caribbean", "TT": "Caribbean", "TC": "Caribbean", "VI": "Caribbean",
+    "AV": "Caribbean",  # Anguilla
+    "AC": "Caribbean",  # Antigua and Barbuda
+    "AA": "Caribbean",  # Aruba
+    "BF": "Caribbean",  # Bahamas
+    "BB": "Caribbean",  # Barbados
+    "VI": "Caribbean",  # British Virgin Islands
+    "CJ": "Caribbean",  # Cayman Islands
+    "CU": "Caribbean",  # Cuba
+    "DO": "Caribbean",  # Dominica
+    "DR": "Caribbean",  # Dominican Republic
+    "GJ": "Caribbean",  # Grenada
+    "GP": "Caribbean",  # Guadeloupe
+    "HA": "Caribbean",  # Haiti
+    "JM": "Caribbean",  # Jamaica
+    "MB": "Caribbean",  # Martinique
+    "MH": "Caribbean",  # Montserrat
+    "RQ": "Caribbean",  # Puerto Rico
+    "TB": "Caribbean",  # St. Barthelemy
+    "SC": "Caribbean",  # St. Kitts and Nevis
+    "ST": "Caribbean",  # St. Lucia
+    "RN": "Caribbean",  # St. Martin
+    "VC": "Caribbean",  # St. Vincent and the Grenadines
+    "NN": "Caribbean",  # Sint Maarten
+    "TD": "Caribbean",  # Trinidad and Tobago
+    "TK": "Caribbean",  # Turks and Caicos
+    "VQ": "Caribbean",  # US Virgin Islands
 
     # Central America (Mexico grouped here for cruise itinerary purposes)
-    "BZ": "Central America", "CR": "Central America", "SV": "Central America",
-    "GT": "Central America", "HN": "Central America", "NI": "Central America",
-    "PA": "Central America", "MX": "Central America",
+    "BH": "Central America",  # Belize
+    "CS": "Central America",  # Costa Rica
+    "ES": "Central America",  # El Salvador
+    "GT": "Central America",  # Guatemala
+    "HO": "Central America",  # Honduras
+    "NU": "Central America",  # Nicaragua
+    "PM": "Central America",  # Panama
+    "MX": "Central America",  # Mexico
 
     # North America
-    "US": "North America", "CA": "North America", "BM": "North America",
+    "US": "North America",  # United States
+    "CA": "North America",  # Canada
+    "BD": "North America",  # Bermuda
 
     # South America
-    "AR": "South America", "BO": "South America", "BR": "South America",
-    "CL": "South America", "CO": "South America", "EC": "South America",
-    "GY": "South America", "PY": "South America", "PE": "South America",
-    "SR": "South America", "UY": "South America", "VE": "South America",
-    "FK": "South America", "GF": "South America",
+    "AR": "South America",  # Argentina
+    "BL": "South America",  # Bolivia
+    "BR": "South America",  # Brazil
+    "CI": "South America",  # Chile
+    "CO": "South America",  # Colombia
+    "EC": "South America",  # Ecuador
+    "GY": "South America",  # Guyana
+    "PA": "South America",  # Paraguay
+    "PE": "South America",  # Peru
+    "NS": "South America",  # Suriname
+    "UY": "South America",  # Uruguay
+    "VE": "South America",  # Venezuela
+    "FK": "South America",  # Falkland Islands
+    "FG": "South America",  # French Guiana
 
     # Mediterranean (incl. Iberian Atlantic and North Africa Med coast)
-    "ES": "Mediterranean", "FR": "Mediterranean", "IT": "Mediterranean",
-    "GR": "Mediterranean", "TR": "Mediterranean", "HR": "Mediterranean",
-    "MT": "Mediterranean", "CY": "Mediterranean", "MC": "Mediterranean",
-    "AL": "Mediterranean", "ME": "Mediterranean", "SI": "Mediterranean",
-    "BA": "Mediterranean", "TN": "Mediterranean", "DZ": "Mediterranean",
-    "MA": "Mediterranean", "LY": "Mediterranean", "EG": "Mediterranean",
-    "IL": "Mediterranean", "LB": "Mediterranean", "PT": "Mediterranean",
-    "GI": "Mediterranean", "VA": "Mediterranean", "SM": "Mediterranean",
-    "AD": "Mediterranean",
+    "SP": "Mediterranean",  # Spain
+    "FR": "Mediterranean",  # France
+    "IT": "Mediterranean",  # Italy
+    "GR": "Mediterranean",  # Greece
+    "TU": "Mediterranean",  # Turkey
+    "HR": "Mediterranean",  # Croatia
+    "MT": "Mediterranean",  # Malta
+    "CY": "Mediterranean",  # Cyprus
+    "MN": "Mediterranean",  # Monaco
+    "AL": "Mediterranean",  # Albania
+    "MJ": "Mediterranean",  # Montenegro
+    "SI": "Mediterranean",  # Slovenia
+    "BK": "Mediterranean",  # Bosnia and Herzegovina
+    "TS": "Mediterranean",  # Tunisia
+    "AG": "Mediterranean",  # Algeria
+    "MO": "Mediterranean",  # Morocco
+    "EG": "Mediterranean",  # Egypt
+    "IS": "Mediterranean",  # Israel
+    "PO": "Mediterranean",  # Portugal
+    "GI": "Mediterranean",  # Gibraltar
+    "VT": "Mediterranean",  # Vatican
+    "SM": "Mediterranean",  # San Marino
+    "AN": "Mediterranean",  # Andorra
+    "MK": "Mediterranean",  # North Macedonia
+    "RI": "Mediterranean",  # Serbia
+    "BU": "Mediterranean",  # Bulgaria
+    "RO": "Mediterranean",  # Romania
+    "GG": "Mediterranean",  # Georgia (Caucasus regional grouping)
 
     # Northern Europe (incl. British Isles, Baltic, Scandinavia)
-    "GB": "Northern Europe", "IE": "Northern Europe", "IS": "Northern Europe",
-    "NO": "Northern Europe", "SE": "Northern Europe", "FI": "Northern Europe",
-    "DK": "Northern Europe", "DE": "Northern Europe", "NL": "Northern Europe",
-    "BE": "Northern Europe", "EE": "Northern Europe", "LV": "Northern Europe",
-    "LT": "Northern Europe", "PL": "Northern Europe", "RU": "Northern Europe",
-    "FO": "Northern Europe", "JE": "Northern Europe", "GG": "Northern Europe",
-    "IM": "Northern Europe", "LU": "Northern Europe",
+    "UK": "Northern Europe",  # United Kingdom
+    "EI": "Northern Europe",  # Ireland
+    "IC": "Northern Europe",  # Iceland
+    "NO": "Northern Europe",  # Norway
+    "SW": "Northern Europe",  # Sweden
+    "FI": "Northern Europe",  # Finland
+    "DA": "Northern Europe",  # Denmark
+    "GM": "Northern Europe",  # Germany
+    "NL": "Northern Europe",  # Netherlands
+    "BE": "Northern Europe",  # Belgium
+    "EN": "Northern Europe",  # Estonia
+    "LG": "Northern Europe",  # Latvia
+    "LH": "Northern Europe",  # Lithuania
+    "PL": "Northern Europe",  # Poland
+    "RS": "Northern Europe",  # Russia
+    "FO": "Northern Europe",  # Faroe Islands
+    "JE": "Northern Europe",  # Jersey
+    "GK": "Northern Europe",  # Guernsey
+    "IM": "Northern Europe",  # Isle of Man
+    "LU": "Northern Europe",  # Luxembourg
+    "AU": "Northern Europe",  # Austria
+    "SZ": "Northern Europe",  # Switzerland
+    "EZ": "Northern Europe",  # Czech Republic
+    "LO": "Northern Europe",  # Slovakia
+    "HU": "Northern Europe",  # Hungary
+    "UP": "Northern Europe",  # Ukraine
+    "BO": "Northern Europe",  # Belarus
+    "MD": "Northern Europe",  # Moldova
+    "LS": "Northern Europe",  # Liechtenstein
+    "AM": "Northern Europe",  # Armenia
+    "AJ": "Northern Europe",  # Azerbaijan
 
     # Asia
-    "JP": "Asia", "KR": "Asia", "KP": "Asia", "CN": "Asia", "TW": "Asia",
-    "HK": "Asia", "MO": "Asia", "VN": "Asia", "TH": "Asia", "MY": "Asia",
-    "SG": "Asia", "ID": "Asia", "PH": "Asia", "BN": "Asia", "KH": "Asia",
-    "MM": "Asia", "LA": "Asia", "IN": "Asia", "LK": "Asia", "BD": "Asia",
-    "MV": "Asia", "PK": "Asia",
+    "JA": "Asia",  # Japan
+    "KS": "Asia",  # South Korea
+    "KN": "Asia",  # North Korea
+    "CH": "Asia",  # China
+    "TW": "Asia",  # Taiwan
+    "HK": "Asia",  # Hong Kong
+    "MC": "Asia",  # Macau
+    "VM": "Asia",  # Vietnam
+    "TH": "Asia",  # Thailand
+    "MY": "Asia",  # Malaysia
+    "SN": "Asia",  # Singapore
+    "ID": "Asia",  # Indonesia
+    "RP": "Asia",  # Philippines
+    "BX": "Asia",  # Brunei
+    "CB": "Asia",  # Cambodia
+    "BM": "Asia",  # Burma (Myanmar)
+    "LA": "Asia",  # Laos
+    "IN": "Asia",  # India
+    "CE": "Asia",  # Sri Lanka
+    "BG": "Asia",  # Bangladesh
+    "MV": "Asia",  # Maldives
+    "PK": "Asia",  # Pakistan
+    "AF": "Asia",  # Afghanistan
+    "NP": "Asia",  # Nepal
+    "BT": "Asia",  # Bhutan
+    "MG": "Asia",  # Mongolia
+    "KZ": "Asia",  # Kazakhstan
+    "KG": "Asia",  # Kyrgyzstan
+    "TI": "Asia",  # Tajikistan
+    "TX": "Asia",  # Turkmenistan
+    "UZ": "Asia",  # Uzbekistan
+    "TT": "Asia",  # East Timor
 
     # Oceania (incl. South Pacific)
-    "AU": "Oceania", "NZ": "Oceania", "FJ": "Oceania", "PG": "Oceania",
-    "SB": "Oceania", "VU": "Oceania", "NC": "Oceania", "PF": "Oceania",
-    "WS": "Oceania", "TO": "Oceania", "KI": "Oceania", "TV": "Oceania",
-    "NR": "Oceania", "PW": "Oceania", "FM": "Oceania", "MH": "Oceania",
-    "CK": "Oceania", "NU": "Oceania",
+    "AS": "Oceania",  # Australia
+    "NZ": "Oceania",  # New Zealand
+    "FJ": "Oceania",  # Fiji
+    "PP": "Oceania",  # Papua New Guinea
+    "BP": "Oceania",  # Solomon Islands
+    "NH": "Oceania",  # Vanuatu
+    "NC": "Oceania",  # New Caledonia
+    "FP": "Oceania",  # French Polynesia
+    "WS": "Oceania",  # Samoa
+    "TN": "Oceania",  # Tonga
+    "KR": "Oceania",  # Kiribati
+    "TV": "Oceania",  # Tuvalu
+    "NR": "Oceania",  # Nauru
+    "PS": "Oceania",  # Palau
+    "FM": "Oceania",  # Micronesia
+    "RM": "Oceania",  # Marshall Islands
+    "CW": "Oceania",  # Cook Islands
+    "NE": "Oceania",  # Niue
 
     # Middle East
-    "AE": "Middle East", "BH": "Middle East", "KW": "Middle East",
-    "OM": "Middle East", "QA": "Middle East", "SA": "Middle East",
-    "YE": "Middle East", "JO": "Middle East", "IR": "Middle East",
-    "IQ": "Middle East", "SY": "Middle East",
+    "AE": "Middle East",  # UAE
+    "BA": "Middle East",  # Bahrain
+    "KU": "Middle East",  # Kuwait
+    "MU": "Middle East",  # Oman
+    "QA": "Middle East",  # Qatar
+    "SA": "Middle East",  # Saudi Arabia
+    "YM": "Middle East",  # Yemen
+    "JO": "Middle East",  # Jordan
+    "IR": "Middle East",  # Iran
+    "IZ": "Middle East",  # Iraq
+    "SY": "Middle East",  # Syria
+    "LE": "Middle East",  # Lebanon
 
     # Africa
-    "ZA": "Africa", "MZ": "Africa", "TZ": "Africa", "KE": "Africa",
-    "MG": "Africa", "MU": "Africa", "SC": "Africa", "RE": "Africa",
-    "NA": "Africa", "AO": "Africa", "GH": "Africa", "SN": "Africa",
-    "CV": "Africa", "GM": "Africa", "DJ": "Africa", "ER": "Africa",
-    "SO": "Africa", "NG": "Africa", "CI": "Africa", "CM": "Africa",
-    "GA": "Africa", "CG": "Africa", "CD": "Africa",
+    "SF": "Africa",  # South Africa
+    "MZ": "Africa",  # Mozambique
+    "TZ": "Africa",  # Tanzania
+    "KE": "Africa",  # Kenya
+    "MA": "Africa",  # Madagascar
+    "MP": "Africa",  # Mauritius
+    "SE": "Africa",  # Seychelles
+    "RE": "Africa",  # Reunion
+    "WA": "Africa",  # Namibia
+    "AO": "Africa",  # Angola
+    "GH": "Africa",  # Ghana
+    "SG": "Africa",  # Senegal
+    "CV": "Africa",  # Cape Verde
+    "GA": "Africa",  # Gambia
+    "DJ": "Africa",  # Djibouti
+    "ER": "Africa",  # Eritrea
+    "SO": "Africa",  # Somalia
+    "NI": "Africa",  # Nigeria
+    "IV": "Africa",  # Cote d'Ivoire
+    "CM": "Africa",  # Cameroon
+    "GB": "Africa",  # Gabon
+    "CF": "Africa",  # Republic of the Congo
+    "CG": "Africa",  # DR Congo
+    "CD": "Africa",  # Chad
+    "UV": "Africa",  # Burkina Faso
+    "ML": "Africa",  # Mali
+    "NG": "Africa",  # Niger
+    "CT": "Africa",  # Central African Republic
+    "OD": "Africa",  # South Sudan
+    "SU": "Africa",  # Sudan
+    "ET": "Africa",  # Ethiopia
+    "UG": "Africa",  # Uganda
+    "RW": "Africa",  # Rwanda
+    "BY": "Africa",  # Burundi
+    "MI": "Africa",  # Malawi
+    "ZA": "Africa",  # Zambia
+    "ZI": "Africa",  # Zimbabwe
+    "BC": "Africa",  # Botswana
+    "WZ": "Africa",  # Eswatini
+    "LT": "Africa",  # Lesotho
+    "LY": "Africa",  # Libya
+    "GV": "Africa",  # Guinea
+    "PU": "Africa",  # Guinea-Bissau
+    "SL": "Africa",  # Sierra Leone
+    "LI": "Africa",  # Liberia
+    "TO": "Africa",  # Togo
+    "BN": "Africa",  # Benin
+    "EK": "Africa",  # Equatorial Guinea
+    "TP": "Africa",  # Sao Tome and Principe
+    "CN": "Africa",  # Comoros
 
-    # Arctic / Antarctic (treated as one polar bucket)
-    "GL": "Arctic", "SJ": "Arctic", "AQ": "Arctic",
+    # Arctic / Antarctic
+    "GL": "Arctic",  # Greenland
+    "SV": "Arctic",  # Svalbard
+    "AY": "Arctic",  # Antarctica
 }
 
 CANONICAL_REGIONS = {

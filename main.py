@@ -30,7 +30,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@cruiseship.watch")
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -918,7 +918,9 @@ def fetch_state_advisories() -> list:
 def upsert_advisory(conn, entry: dict) -> Optional[dict]:
     """Upsert a single advisory entry. Returns dict {country_code, level, region, advisory_id, prev_level}
     on success, None on skip/error."""
-    country_code = (entry.get("Category") or entry.get("category") or "").strip().upper()
+    cat_raw = entry.get("Category") or entry.get("category") or ""
+    if isinstance(cat_raw, list): cat_raw = cat_raw[0] if cat_raw else ""
+    country_code = str(cat_raw).strip().upper()
     if not country_code or len(country_code) > 5:
         return None
 
@@ -927,6 +929,17 @@ def upsert_advisory(conn, entry: dict) -> Optional[dict]:
     link = entry.get("Link") or entry.get("link") or ""
     published = entry.get("Published") or entry.get("published") or ""
     updated = entry.get("Updated") or entry.get("updated") or ""
+    # Coerce list fields (State Dept API sometimes returns lists for these)
+    if isinstance(title, list): title = title[0] if title else ""
+    if isinstance(summary, list): summary = summary[0] if summary else ""
+    if isinstance(link, list): link = link[0] if link else ""
+    if isinstance(published, list): published = published[0] if published else ""
+    if isinstance(updated, list): updated = updated[0] if updated else ""
+    title = str(title)
+    summary = str(summary)
+    link = str(link)
+    published = str(published)
+    updated = str(updated)
     level = parse_advisory_level(title)
     country_name = parse_country_name_from_title(title, country_code)
     region = get_region_for_country(country_code)

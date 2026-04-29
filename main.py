@@ -30,7 +30,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@cruiseship.watch")
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -732,6 +732,22 @@ def init_db():
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_advisories_region ON advisories (region)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_advisories_level ON advisories (level)")
+
+    # Marine forecasts (NOAA High Seas) — one row per HSF area, refreshed daily.
+    c.execute("""CREATE TABLE IF NOT EXISTS marine_forecasts (
+        id SERIAL PRIMARY KEY,
+        area_code TEXT UNIQUE NOT NULL,
+        area_name TEXT,
+        regions TEXT,
+        max_wave_m REAL,
+        sea_state TEXT,
+        raw_text TEXT,
+        source_url TEXT,
+        issued_at TEXT,
+        fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_marine_regions ON marine_forecasts (regions)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_marine_state ON marine_forecasts (sea_state)")
 
     conn.commit()
     conn.close()
@@ -1444,6 +1460,345 @@ async def advisory_check_now():
     return {"message": "State Dept advisory check started"}
 
 
+# ── Marine (NOAA High Seas Forecast) ──────────────────────────────────────────
+# Each entry: NOAA text-bulletin URL, an internal area code (stable key),
+# a friendly area name, and the canonical CW regions this bulletin covers.
+
+MARINE_AREAS = [
+    {
+        "code": "HSFAT2",
+        "name": "Tropical N Atlantic & Caribbean",
+        "url": "https://tgftp.nws.noaa.gov/data/raw/fz/fznt02.knhc.hsf.at2.txt",
+        "regions": ["Caribbean", "Central America", "South America"],
+    },
+    {
+        "code": "HSFNT1",
+        "name": "Atlantic (NE Atlantic & Offshore U.S.)",
+        "url": "https://tgftp.nws.noaa.gov/data/raw/fz/fznt01.kwbc.hsf.nt1.txt",
+        "regions": ["North America", "Mediterranean", "Northern Europe", "Africa"],
+    },
+    {
+        "code": "HSFEP2",
+        "name": "Tropical NE Pacific",
+        "url": "https://tgftp.nws.noaa.gov/data/raw/fz/fzpn03.knhc.hsf.ep2.txt",
+        "regions": ["Central America"],
+    },
+    {
+        "code": "HSFNP",
+        "name": "NE Pacific (Offshore U.S. & Hawaii N)",
+        "url": "https://tgftp.nws.noaa.gov/data/raw/fz/fzpn02.kwbc.hsf.np.txt",
+        "regions": ["North America"],
+    },
+    {
+        "code": "HSFNP_HAWAII",
+        "name": "Central Pacific (Hawaii & SW Pacific)",
+        "url": "https://tgftp.nws.noaa.gov/data/raw/fz/fzpn40.phfo.hsf.npa.txt",
+        "regions": ["Oceania"],
+    },
+    {
+        "code": "HSFNP_AK",
+        "name": "Alaska / Bering Sea / Arctic",
+        "url": "https://tgftp.nws.noaa.gov/data/raw/fz/fzak50.pawu.hsf.ak.txt",
+        "regions": ["Arctic"],
+    },
+    {
+        "code": "HSFAS",
+        "name": "Asia Pacific (issued by JMA)",
+        "url": "https://tgftp.nws.noaa.gov/data/raw/fz/fzpn01.rjtd.hsf.as.txt",
+        "regions": ["Asia"],
+    },
+    {
+        "code": "HSFIO",
+        "name": "Indian Ocean / Middle East seas",
+        "url": "https://tgftp.nws.noaa.gov/data/raw/fz/fzio01.fmee.hsf.io.txt",
+        "regions": ["Middle East", "Africa"],
+    },
+]
+
+
+def _parse_max_wave_meters(text: str) -> Optional[float]:
+    """Extract the largest 'SEAS X TO Y M' value from a NOAA HSF bulletin.
+    Returns max wave height in meters, or None if not found."""
+    if not text:
+        return None
+    max_m = None
+    # Match patterns like "SEAS 2.5 TO 4.5 M", "SEAS TO 4 M", "SEAS 3 M"
+    pattern = re.compile(
+        r"SEAS\s+(?:TO\s+)?(\d+(?:\.\d+)?)\s*(?:TO\s+(\d+(?:\.\d+)?)\s*)?M\b",
+        re.IGNORECASE,
+    )
+    for m in pattern.finditer(text):
+        try:
+            a = float(m.group(1))
+            b = float(m.group(2)) if m.group(2) else a
+            top = max(a, b)
+            if max_m is None or top > max_m:
+                max_m = top
+        except (TypeError, ValueError):
+            continue
+    return max_m
+
+
+def _sea_state_for_wave(max_m: Optional[float]) -> str:
+    """Three-tier sea-state label tied to significant wave height (meters)."""
+    if max_m is None:
+        return "unknown"
+    if max_m < 2.5:
+        return "calm"
+    if max_m < 4.0:
+        return "moderate"
+    return "rough"
+
+
+def _fetch_marine_bulletin(url: str) -> Optional[str]:
+    """Fetch a NOAA marine text bulletin. Returns raw text or None."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "CruiseShipWatch/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read()
+        try:
+            return data.decode("utf-8", errors="replace")
+        except Exception:
+            return data.decode("latin-1", errors="replace")
+    except Exception as e:
+        print("[marine] fetch failed for " + url + ": " + str(e))
+        return None
+
+
+def _extract_issued_at(text: str) -> Optional[str]:
+    """Pull the issuance datetime line from a NOAA bulletin if present.
+    Returns the raw line (e.g. '0430 UTC SUN JAN 18 2026') or None."""
+    if not text:
+        return None
+    m = re.search(r"\b\d{3,4}\s+UTC\s+\w{3}\s+\w{3}\s+\d{1,2}\s+\d{4}\b", text)
+    return m.group(0) if m else None
+
+
+def check_marine_forecasts():
+    """Pull all configured NOAA HSF bulletins, upsert, and fire alerts on
+    transitions into moderate/rough sea state for any watchlist ship in
+    a covered region."""
+    print("[" + str(datetime.utcnow()) + "] Starting marine forecast check...")
+    upserted = 0
+    transitions = []  # list of (area_code, area_name, regions, prev_state, new_state, max_m)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        for area in MARINE_AREAS:
+            text = _fetch_marine_bulletin(area["url"])
+            if not text:
+                continue
+            max_m = _parse_max_wave_meters(text)
+            new_state = _sea_state_for_wave(max_m)
+            issued_at = _extract_issued_at(text)
+            regions_csv = ",".join(area["regions"])
+
+            # Read prior state for transition detection
+            c.execute(
+                "SELECT sea_state FROM marine_forecasts WHERE area_code = %s",
+                (area["code"],),
+            )
+            prior = c.fetchone()
+            prev_state = prior[0] if prior else None
+
+            c.execute(
+                """
+                INSERT INTO marine_forecasts
+                    (area_code, area_name, regions, max_wave_m, sea_state, raw_text,
+                     source_url, issued_at, fetched_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (area_code) DO UPDATE SET
+                    area_name = EXCLUDED.area_name,
+                    regions = EXCLUDED.regions,
+                    max_wave_m = EXCLUDED.max_wave_m,
+                    sea_state = EXCLUDED.sea_state,
+                    raw_text = EXCLUDED.raw_text,
+                    source_url = EXCLUDED.source_url,
+                    issued_at = EXCLUDED.issued_at,
+                    fetched_at = EXCLUDED.fetched_at
+                """,
+                (
+                    area["code"],
+                    area["name"],
+                    regions_csv,
+                    max_m,
+                    new_state,
+                    text[:20000],
+                    area["url"],
+                    issued_at,
+                    datetime.utcnow(),
+                ),
+            )
+            upserted += 1
+
+            # Fire alerts only when the bulletin escalates the sea state.
+            severity = {"unknown": 0, "calm": 1, "moderate": 2, "rough": 3}
+            if prev_state and severity.get(new_state, 0) > severity.get(prev_state, 0):
+                transitions.append(
+                    (area["code"], area["name"], area["regions"], prev_state, new_state, max_m)
+                )
+
+        conn.commit()
+
+        # For each transition, alert affected watchlist ships.
+        alerts_fired = 0
+        for area_code, area_name, regions, prev_state, new_state, max_m in transitions:
+            for region in regions:
+                c.execute(
+                    """
+                    SELECT w.id, w.user_id, w.name, u.email
+                    FROM watchlist w JOIN users u ON u.id = w.user_id
+                    WHERE w.region = %s AND w.status = 'active'
+                    """,
+                    (region,),
+                )
+                affected = c.fetchall()
+                for watch_id, user_id, watch_name, user_email in affected:
+                    wave_str = ("%.1f m" % max_m) if max_m is not None else "elevated"
+                    msg = (
+                        "Sea state in " + region + " has worsened to "
+                        + new_state + " (" + wave_str + "). Source: NWS High Seas Forecast — "
+                        + area_name + "."
+                    )
+                    # De-dupe: skip if we already fired this exact transition msg recently.
+                    c.execute(
+                        """SELECT id FROM notifications
+                           WHERE watchlist_id = %s AND message = %s
+                             AND created_at > NOW() - INTERVAL '24 hours'""",
+                        (watch_id, msg),
+                    )
+                    if c.fetchone():
+                        continue
+                    c.execute(
+                        """INSERT INTO notifications
+                               (user_id, watchlist_id, obituary_id, message, email_sent, source_type)
+                           VALUES (%s, %s, NULL, %s, FALSE, 'marine')""",
+                        (user_id, watch_id, msg),
+                    )
+                    alerts_fired += 1
+
+        conn.commit()
+
+    print(
+        "[" + str(datetime.utcnow()) + "] Marine check complete. "
+        + str(upserted) + " areas upserted, "
+        + str(len(transitions)) + " transitions, "
+        + str(alerts_fired) + " alerts fired."
+    )
+
+
+@app.get("/admin/marine-check-now")
+async def marine_check_now():
+    """Manually trigger a NOAA marine forecast pull + alert pass."""
+    threading.Thread(target=check_marine_forecasts, daemon=True).start()
+    return {"message": "Marine forecast check started"}
+
+
+@app.get("/admin/marine")
+async def admin_list_marine():
+    """List cached marine forecasts."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT area_code, area_name, regions, max_wave_m, sea_state,
+                   source_url, issued_at, fetched_at
+            FROM marine_forecasts
+            ORDER BY sea_state DESC, area_name ASC
+        """)
+        rows = c.fetchall()
+        return {
+            "count": len(rows),
+            "areas": [
+                {
+                    "area_code": r[0],
+                    "area_name": r[1],
+                    "regions": r[2].split(",") if r[2] else [],
+                    "max_wave_m": r[3],
+                    "sea_state": r[4],
+                    "source_url": r[5],
+                    "issued_at": r[6],
+                    "fetched_at": str(r[7]) if r[7] else None,
+                }
+                for r in rows
+            ],
+        }
+
+
+@app.get("/watchlist/{item_id}/marine")
+async def get_watchlist_marine(item_id: int, user_id: int = Depends(get_current_user)):
+    """Return cached NOAA marine forecasts for the ship's region."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id, name, region, location
+            FROM watchlist
+            WHERE id = %s AND user_id = %s AND status = 'active'
+            """,
+            (item_id, user_id),
+        )
+        row = c.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Watchlist item not found")
+        watch_id, watch_name, region, location_legacy = row
+        canonical = normalize_region_label(region) or normalize_region_label(location_legacy)
+
+        if not canonical:
+            return {
+                "watchlist_id": watch_id,
+                "ship_name": watch_name,
+                "region": region or location_legacy,
+                "canonical_region": None,
+                "marine": [],
+                "note": "Region not recognized — no marine forecast returned.",
+            }
+
+        # Match any forecast whose regions CSV contains the canonical region.
+        c.execute(
+            """
+            SELECT area_code, area_name, regions, max_wave_m, sea_state, raw_text,
+                   source_url, issued_at, fetched_at
+            FROM marine_forecasts
+            WHERE regions LIKE %s OR regions LIKE %s OR regions LIKE %s OR regions = %s
+            ORDER BY
+                CASE sea_state
+                    WHEN 'rough' THEN 0
+                    WHEN 'moderate' THEN 1
+                    WHEN 'calm' THEN 2
+                    ELSE 3
+                END,
+                area_name ASC
+            """,
+            (
+                canonical + ",%",
+                "%," + canonical + ",%",
+                "%," + canonical,
+                canonical,
+            ),
+        )
+        rows = c.fetchall()
+        return {
+            "watchlist_id": watch_id,
+            "ship_name": watch_name,
+            "region": region or location_legacy,
+            "canonical_region": canonical,
+            "marine": [
+                {
+                    "area_code": r[0],
+                    "area_name": r[1],
+                    "regions": r[2].split(",") if r[2] else [],
+                    "max_wave_m": r[3],
+                    "sea_state": r[4],
+                    "raw_text": r[5],
+                    "source_url": r[6],
+                    "issued_at": r[7],
+                    "fetched_at": str(r[8]) if r[8] else None,
+                }
+                for r in rows
+            ],
+        }
+
+
 @app.get("/admin/advisories")
 async def admin_list_advisories(level_min: int = 0):
     """List cached advisories filtered by minimum level."""
@@ -2006,11 +2361,15 @@ def check_wikipedia_watchlist():
 
 def run_daily_cycle():
     """The combined daily check. State Dept first (cheap, single API call),
-    then Wikipedia (per-watchlist sweeps)."""
+    then NOAA marine forecasts, then Wikipedia (per-watchlist sweeps)."""
     try:
         check_state_advisories()
     except Exception as e:
         print("[cron] check_state_advisories failed: " + str(e))
+    try:
+        check_marine_forecasts()
+    except Exception as e:
+        print("[cron] check_marine_forecasts failed: " + str(e))
     try:
         check_wikipedia_watchlist()
     except Exception as e:
@@ -2033,6 +2392,8 @@ async def startup_event():
     print("Background scheduler started (24hr cycle: state advisories + wiki check)")
     threading.Thread(target=check_state_advisories, daemon=True).start()
     print("Initial State Dept advisory check started")
+    threading.Thread(target=check_marine_forecasts, daemon=True).start()
+    print("Initial NOAA marine forecast check started")
     threading.Thread(target=check_wikipedia_watchlist, daemon=True).start()
     print("Initial Wikipedia watchlist check started")
 

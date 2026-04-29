@@ -30,7 +30,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@cruiseship.watch")
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -302,7 +302,7 @@ COUNTRY_TO_REGION = {
 CANONICAL_REGIONS = {
     "Caribbean", "Mediterranean", "Northern Europe", "North America",
     "Central America", "South America", "Asia", "Oceania",
-    "Middle East", "Africa", "Arctic",
+    "Middle East", "Africa", "Arctic", "Alaska",
 }
 
 # Common user-facing labels and shortcuts → canonical bucket.
@@ -338,6 +338,12 @@ REGION_ALIASES = {
     "norway": "Northern Europe",
     "norwegian fjords": "Northern Europe",
     "fjords": "Northern Europe",
+
+    # Alaska
+    "alaska": "Alaska",
+    "alaskan": "Alaska",
+    "inside passage": "Alaska",
+    "glacier bay": "Alaska",
     "scandinavia": "Northern Europe",
     "iceland": "Northern Europe",
     "europe": "Northern Europe",
@@ -1579,7 +1585,7 @@ MARINE_AREAS = [
         "code": "HSFNP_AK",
         "name": "Alaska / Bering Sea / Arctic",
         "url": "https://tgftp.nws.noaa.gov/data/raw/fz/fzak50.pawu.hsf.ak.txt",
-        "regions": ["Arctic"],
+        "regions": ["Alaska", "Arctic"],
     },
     {
         "code": "HSFAS",

@@ -30,7 +30,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@cruiseship.watch")
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -1172,80 +1172,103 @@ def upsert_advisory(conn, entry: dict) -> Optional[dict]:
 
 
 def fire_advisory_alerts(conn, advisory: dict) -> int:
-    """For an advisory at level >= 3 with a known region, find watched ships in that region
-    and fire alerts (with 7-day dedup per (watchlist_id, advisory_id)). Returns number fired."""
-    if not advisory:
-        return 0
-    if (advisory.get("level") or 0) < 3:
-        return 0
-    region = advisory.get("region")
+    """Deprecated as of 0.1.5: per-advisory fan-out caused N alerts per ship.
+    Replaced by reconcile_advisory_alerts_for_ship() which writes only the
+    top-level set per ship per region in a single pass. Kept as a no-op so
+    older call sites remain harmless."""
+    return 0
+
+
+def reconcile_advisory_alerts_for_ship(conn, watch_id: int, user_id: int,
+                                       ship_name: str, region: str,
+                                       user_email: Optional[str]) -> int:
+    """Replace this ship's State-Dept advisory notifications with only the
+    current top-level set for its region. Returns number of fresh alerts written.
+
+    Algorithm: find max level (>=3) in this ship's region. Delete all prior
+    `source_type='advisory'` notifications for this ship. Insert one notification
+    per advisory at that max level. Email the user once with a digest if the
+    digest content has changed since the last successful email.
+    """
     if not region:
         return 0
+    c = conn.cursor()
 
-    advisory_id = advisory["advisory_id"]
-    country_code = advisory["country_code"]
-    country_name = advisory.get("country_name") or country_code
-    level = advisory["level"]
-    title = advisory.get("title") or ""
-    summary = advisory.get("summary") or ""
-    url = advisory.get("url") or ""
+    # Find max level >= 3 for this region
+    c.execute("""
+        SELECT MAX(level) FROM advisories
+        WHERE region = %s AND level >= 3
+    """, (region,))
+    max_row = c.fetchone()
+    max_level = (max_row and max_row[0]) or 0
+    if max_level < 3:
+        # No qualifying advisories — clear any stale notifications for this ship.
+        c.execute("""
+            DELETE FROM notifications
+            WHERE watchlist_id = %s AND source_type = 'advisory'
+        """, (watch_id,))
+        return 0
+
+    # Pull all advisories at max_level for this region
+    c.execute("""
+        SELECT id, country_code, country_name, level, title, summary, url
+        FROM advisories
+        WHERE region = %s AND level = %s
+        ORDER BY country_name ASC
+    """, (region, max_level))
+    top = c.fetchall()
+    if not top:
+        return 0
+
+    # Wipe prior advisory notifications for this ship — only the latest snapshot remains.
+    c.execute("""
+        DELETE FROM notifications
+        WHERE watchlist_id = %s AND source_type = 'advisory'
+    """, (watch_id,))
 
     fired = 0
-    c = conn.cursor()
-    c.execute("""
-        SELECT w.id, w.user_id, w.name, u.email
-        FROM watchlist w
-        JOIN users u ON w.user_id = u.id
-        WHERE w.status = 'active' AND w.region = %s
-    """, (region,))
-    rows = c.fetchall()
-
-    cutoff = datetime.utcnow() - timedelta(days=7)
-
-    for watch_id, user_id, ship_name, user_email in rows:
-        # 7-day dedup: skip if we've already alerted for this advisory_id within the window.
-        c.execute("""
-            SELECT id FROM notifications
-            WHERE watchlist_id = %s
-              AND source_type = 'advisory'
-              AND source_ref_id = %s
-              AND created_at > %s
-            LIMIT 1
-        """, (watch_id, advisory_id, cutoff))
-        if c.fetchone():
-            continue
-
+    digest_lines = []
+    for adv_id, country_code, country_name, level, title, summary, url in top:
         message = (
-            "Travel advisory (Level " + str(level) + ") for " + country_name +
+            "Travel advisory (Level " + str(level) + ") for " + (country_name or country_code) +
             " in " + region + " — affects " + ship_name + "."
         )
         c.execute("""
             INSERT INTO notifications
                 (user_id, watchlist_id, obituary_id, message, email_sent, source_type, source_ref_id)
-            VALUES (%s, %s, NULL, %s, %s, 'advisory', %s)
-            RETURNING id
-        """, (user_id, watch_id, message, False, advisory_id))
-        notif_id = c.fetchone()[0]
-        conn.commit()
+            VALUES (%s, %s, NULL, %s, FALSE, 'advisory', %s)
+        """, (user_id, watch_id, message, adv_id))
         fired += 1
+        digest_lines.append("• Level " + str(level) + " — " + (country_name or country_code))
 
-        if user_email:
-            sent = send_advisory_email(
-                user_email, ship_name, region, country_name, level, title, summary, url
+    # One email per ship per reconcile (only if there's content). Email the
+    # FIRST advisory in the digest as the primary, callers can browse drawer for the rest.
+    if user_email and top:
+        primary = top[0]
+        try:
+            send_advisory_email(
+                user_email, ship_name, region,
+                primary[2] or primary[1],     # country_name fallback to code
+                primary[3],                    # level
+                primary[4] or "",              # title
+                primary[5] or "",              # summary
+                primary[6] or ""               # url
             )
-            if sent:
-                c.execute("UPDATE notifications SET email_sent = TRUE WHERE id = %s", (notif_id,))
-                conn.commit()
+        except Exception as e:
+            print("[advisories] email send failed for " + ship_name + ": " + str(e))
 
-    if fired:
-        print("[advisories] Fired " + str(fired) + " alerts for " +
-              country_code + " (Level " + str(level) + ", " + region + ")")
     return fired
 
 
 def check_state_advisories():
-    """Pull the State Dept advisories feed, upsert each entry, fire alerts for watched ships
-    in matching regions at level >= 3 with 7-day dedup."""
+    """Pull the State Dept advisories feed, upsert each entry, then for each
+    active watchlist ship reconcile its advisory notifications to the current
+    top-level set for its region (delete prior, insert latest snapshot).
+
+    This guarantees the user only ever sees the most recent State Dept state,
+    capped at the highest severity level in their ship's region — no
+    accumulation across cron runs.
+    """
     print("[" + str(datetime.now()) + "] Starting State Dept advisory check...")
     entries = fetch_state_advisories()
     if not entries:
@@ -1253,21 +1276,43 @@ def check_state_advisories():
         return
 
     upserted = 0
-    total_fired = 0
     with get_db() as conn:
+        # Pass 1: upsert all advisories (data-only)
         for entry in entries:
             try:
                 result = upsert_advisory(conn, entry)
                 conn.commit()
                 if result:
                     upserted += 1
-                    total_fired += fire_advisory_alerts(conn, result)
             except Exception as e:
                 conn.rollback()
                 print("[advisories] Upsert error for entry: " + str(e))
                 continue
+
+        # Pass 2: reconcile per active watchlist ship
+        c = conn.cursor()
+        c.execute("""
+            SELECT w.id, w.user_id, w.name, w.region, u.email
+            FROM watchlist w
+            JOIN users u ON w.user_id = u.id
+            WHERE w.status = 'active' AND w.region IS NOT NULL AND w.region <> ''
+        """)
+        ships = c.fetchall()
+
+        total_fired = 0
+        for watch_id, user_id, ship_name, region, user_email in ships:
+            try:
+                total_fired += reconcile_advisory_alerts_for_ship(
+                    conn, watch_id, user_id, ship_name, region, user_email
+                )
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print("[advisories] Reconcile error for ship " + str(watch_id) + ": " + str(e))
+                continue
+
     print("[" + str(datetime.now()) + "] Advisory check complete. "
-          + str(upserted) + " upserted, " + str(total_fired) + " alerts fired.")
+          + str(upserted) + " upserted, " + str(total_fired) + " alerts written.")
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -1458,6 +1503,41 @@ async def advisory_check_now():
     """Manually trigger a State Dept advisory pull + alert pass."""
     threading.Thread(target=check_state_advisories, daemon=True).start()
     return {"message": "State Dept advisory check started"}
+
+
+@app.get("/admin/advisory-reconcile-all")
+async def advisory_reconcile_all():
+    """Force a reconcile pass for every active watchlist ship using already-cached
+    advisories. Use this after deploy to clean up legacy duplicate alerts without
+    waiting for the next cron tick."""
+    def _do():
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("""
+                    SELECT w.id, w.user_id, w.name, w.region, u.email
+                    FROM watchlist w
+                    JOIN users u ON w.user_id = u.id
+                    WHERE w.status = 'active' AND w.region IS NOT NULL AND w.region <> ''
+                """)
+                ships = c.fetchall()
+                total = 0
+                for watch_id, user_id, ship_name, region, user_email in ships:
+                    try:
+                        total += reconcile_advisory_alerts_for_ship(
+                            conn, watch_id, user_id, ship_name, region, user_email
+                        )
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        print("[reconcile-all] error for ship " + str(watch_id) + ": " + str(e))
+                print("[reconcile-all] complete. " + str(total) + " alerts written across "
+                      + str(len(ships)) + " ships.")
+        except Exception as e:
+            print("[reconcile-all] fatal: " + str(e))
+
+    threading.Thread(target=_do, daemon=True).start()
+    return {"message": "Advisory reconcile started for all active watchlist ships"}
 
 
 # ── Marine (NOAA High Seas Forecast) ──────────────────────────────────────────

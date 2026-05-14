@@ -30,7 +30,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@cruiseship.watch")
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -722,6 +722,28 @@ def init_db():
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_outbreaks_ship ON outbreaks (ship_name)")
 
+    # v0.1.8: widen outbreaks for WHO DON (and any future non-ship sources).
+    # ship_name was NOT NULL — relax so country-level rows can land here.
+    # Generic columns added idempotently. CDC VSP rows (if ever scraped)
+    # leave the new columns NULL; WHO DON rows leave ship_name/cruise_line NULL.
+    try:
+        c.execute("ALTER TABLE outbreaks ALTER COLUMN ship_name DROP NOT NULL")
+    except Exception as _e:
+        conn.rollback()
+        c = conn.cursor()
+    c.execute("ALTER TABLE outbreaks ADD COLUMN IF NOT EXISTS source TEXT")
+    c.execute("ALTER TABLE outbreaks ADD COLUMN IF NOT EXISTS outbreak_id TEXT")
+    c.execute("ALTER TABLE outbreaks ADD COLUMN IF NOT EXISTS title TEXT")
+    c.execute("ALTER TABLE outbreaks ADD COLUMN IF NOT EXISTS location TEXT")
+    c.execute("ALTER TABLE outbreaks ADD COLUMN IF NOT EXISTS country_code TEXT")
+    c.execute("ALTER TABLE outbreaks ADD COLUMN IF NOT EXISTS region TEXT")
+    c.execute("ALTER TABLE outbreaks ADD COLUMN IF NOT EXISTS report_date TEXT")
+    c.execute("ALTER TABLE outbreaks ADD COLUMN IF NOT EXISTS summary TEXT")
+    c.execute("ALTER TABLE outbreaks ADD COLUMN IF NOT EXISTS raw_json TEXT")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbreaks_outbreak_id ON outbreaks (outbreak_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_outbreaks_source ON outbreaks (source)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_outbreaks_country_code ON outbreaks (country_code)")
+
     # Advisories (State Dept) — active in v0.1.1
     c.execute("""CREATE TABLE IF NOT EXISTS advisories (
         id SERIAL PRIMARY KEY,
@@ -1321,6 +1343,269 @@ def check_state_advisories():
           + str(upserted) + " upserted, " + str(total_fired) + " alerts written.")
 
 
+# ── WHO Disease Outbreak News (v0.1.8) ────────────────────────────────────────
+# Canonical international outbreak record. WHO publishes within days of an
+# outbreak announcement. OData v4 JSON API. The `regionscountries` field is
+# a UUID reference to a related entity (would require a second call to
+# resolve); we parse country from the title instead — reliable for ~99% of
+# DON reports.
+#
+# Storage: shared `outbreaks` table, source='who_don'. Country code is ISO
+# 3166-1 alpha-2 (NOT FIPS — separate from `advisories.country_code` which
+# uses State Dept FIPS codes). TW destinations join on ISO; advisories
+# continue joining by country name (the "split" decision).
+
+WHO_DON_URL = "https://www.who.int/api/news/diseaseoutbreaknews"
+WHO_DON_FETCH_LIMIT = 50
+
+# UN member states + common short forms WHO uses in DON titles. Order
+# matters: longer multi-word names BEFORE their shorter components so
+# "Democratic Republic of the Congo" wins over "Congo". DO NOT alphabetize.
+WHO_DON_COUNTRIES = [
+    "Democratic Republic of the Congo", "United Arab Emirates", "United Kingdom",
+    "United States of America", "United States", "Saint Vincent and the Grenadines",
+    "Saint Kitts and Nevis", "Sao Tome and Principe", "Bosnia and Herzegovina",
+    "Trinidad and Tobago", "Antigua and Barbuda", "Central African Republic",
+    "Papua New Guinea", "Marshall Islands", "Solomon Islands", "North Macedonia",
+    "North Korea", "South Korea", "South Sudan", "South Africa", "Saudi Arabia",
+    "Sri Lanka", "Sierra Leone", "Equatorial Guinea", "Guinea-Bissau", "Costa Rica",
+    "Cote d'Ivoire", "El Salvador", "Dominican Republic", "Burkina Faso",
+    "New Zealand", "Cabo Verde", "Czech Republic", "Timor-Leste", "Cook Islands",
+    "Afghanistan", "Albania", "Algeria", "Andorra", "Angola", "Argentina",
+    "Armenia", "Australia", "Austria", "Azerbaijan", "Bahamas", "Bahrain",
+    "Bangladesh", "Barbados", "Belarus", "Belgium", "Belize", "Benin", "Bhutan",
+    "Bolivia", "Botswana", "Brazil", "Brunei", "Bulgaria", "Burundi", "Cambodia",
+    "Cameroon", "Canada", "Chad", "Chile", "China", "Colombia", "Comoros",
+    "Croatia", "Cuba", "Cyprus", "Denmark", "Djibouti", "Dominica", "Ecuador",
+    "Egypt", "Eritrea", "Estonia", "Eswatini", "Ethiopia", "Fiji", "Finland",
+    "France", "Gabon", "Gambia", "Georgia", "Germany", "Ghana", "Greece",
+    "Grenada", "Guatemala", "Guinea", "Guyana", "Haiti", "Honduras", "Hungary",
+    "Iceland", "India", "Indonesia", "Iran", "Iraq", "Ireland", "Israel",
+    "Italy", "Jamaica", "Japan", "Jordan", "Kazakhstan", "Kenya", "Kiribati",
+    "Kuwait", "Kyrgyzstan", "Laos", "Latvia", "Lebanon", "Lesotho", "Liberia",
+    "Libya", "Liechtenstein", "Lithuania", "Luxembourg", "Madagascar", "Malawi",
+    "Malaysia", "Maldives", "Mali", "Malta", "Mauritania", "Mauritius", "Mexico",
+    "Micronesia", "Moldova", "Monaco", "Mongolia", "Montenegro", "Morocco",
+    "Mozambique", "Myanmar", "Namibia", "Nauru", "Nepal", "Netherlands",
+    "Nicaragua", "Niger", "Nigeria", "Norway", "Oman", "Pakistan", "Palau",
+    "Palestine", "Panama", "Paraguay", "Peru", "Philippines", "Poland",
+    "Portugal", "Qatar", "Romania", "Russia", "Rwanda", "Saint Lucia", "Samoa",
+    "San Marino", "Senegal", "Serbia", "Seychelles", "Singapore", "Slovakia",
+    "Slovenia", "Somalia", "Spain", "Sudan", "Suriname", "Sweden", "Switzerland",
+    "Syria", "Taiwan", "Tajikistan", "Tanzania", "Thailand", "Togo", "Tonga",
+    "Tunisia", "Turkey", "Turkmenistan", "Tuvalu", "Uganda", "Ukraine",
+    "Uruguay", "Uzbekistan", "Vanuatu", "Venezuela", "Vietnam", "Yemen",
+    "Zambia", "Zimbabwe", "Congo",
+]
+_WHO_DON_COUNTRIES_LC = [(c.lower(), c) for c in WHO_DON_COUNTRIES]
+
+# Name -> ISO 3166-1 alpha-2 code map for WHO DON country tags.
+# Both "United States" and "United States of America" map to "US". WHO's
+# title parser prefers the longer form, so most stored rows have
+# country="United States of America"; both names are listed here so
+# downstream lookups succeed either way.
+WHO_NAME_TO_CODE = {
+    "Democratic Republic of the Congo": "CD",
+    "United Arab Emirates": "AE", "United Kingdom": "GB",
+    "United States of America": "US", "United States": "US",
+    "Saint Vincent and the Grenadines": "VC",
+    "Saint Kitts and Nevis": "KN", "Sao Tome and Principe": "ST",
+    "Bosnia and Herzegovina": "BA", "Trinidad and Tobago": "TT",
+    "Antigua and Barbuda": "AG", "Central African Republic": "CF",
+    "Papua New Guinea": "PG", "Marshall Islands": "MH",
+    "Solomon Islands": "SB", "North Macedonia": "MK",
+    "North Korea": "KP", "South Korea": "KR", "South Sudan": "SS",
+    "South Africa": "ZA", "Saudi Arabia": "SA", "Sri Lanka": "LK",
+    "Sierra Leone": "SL", "Equatorial Guinea": "GQ",
+    "Guinea-Bissau": "GW", "Costa Rica": "CR", "Cote d'Ivoire": "CI",
+    "El Salvador": "SV", "Dominican Republic": "DO", "Burkina Faso": "BF",
+    "New Zealand": "NZ", "Cabo Verde": "CV", "Czech Republic": "CZ",
+    "Timor-Leste": "TL", "Cook Islands": "CK",
+    "Afghanistan": "AF", "Albania": "AL", "Algeria": "DZ", "Andorra": "AD",
+    "Angola": "AO", "Argentina": "AR", "Armenia": "AM", "Australia": "AU",
+    "Austria": "AT", "Azerbaijan": "AZ", "Bahamas": "BS", "Bahrain": "BH",
+    "Bangladesh": "BD", "Barbados": "BB", "Belarus": "BY", "Belgium": "BE",
+    "Belize": "BZ", "Benin": "BJ", "Bhutan": "BT", "Bolivia": "BO",
+    "Botswana": "BW", "Brazil": "BR", "Brunei": "BN", "Bulgaria": "BG",
+    "Burundi": "BI", "Cambodia": "KH", "Cameroon": "CM", "Canada": "CA",
+    "Chad": "TD", "Chile": "CL", "China": "CN", "Colombia": "CO",
+    "Comoros": "KM", "Croatia": "HR", "Cuba": "CU", "Cyprus": "CY",
+    "Denmark": "DK", "Djibouti": "DJ", "Dominica": "DM", "Ecuador": "EC",
+    "Egypt": "EG", "Eritrea": "ER", "Estonia": "EE", "Eswatini": "SZ",
+    "Ethiopia": "ET", "Fiji": "FJ", "Finland": "FI", "France": "FR",
+    "Gabon": "GA", "Gambia": "GM", "Georgia": "GE", "Germany": "DE",
+    "Ghana": "GH", "Greece": "GR", "Grenada": "GD", "Guatemala": "GT",
+    "Guinea": "GN", "Guyana": "GY", "Haiti": "HT", "Honduras": "HN",
+    "Hungary": "HU", "Iceland": "IS", "India": "IN", "Indonesia": "ID",
+    "Iran": "IR", "Iraq": "IQ", "Ireland": "IE", "Israel": "IL",
+    "Italy": "IT", "Jamaica": "JM", "Japan": "JP", "Jordan": "JO",
+    "Kazakhstan": "KZ", "Kenya": "KE", "Kiribati": "KI", "Kuwait": "KW",
+    "Kyrgyzstan": "KG", "Laos": "LA", "Latvia": "LV", "Lebanon": "LB",
+    "Lesotho": "LS", "Liberia": "LR", "Libya": "LY", "Liechtenstein": "LI",
+    "Lithuania": "LT", "Luxembourg": "LU", "Madagascar": "MG", "Malawi": "MW",
+    "Malaysia": "MY", "Maldives": "MV", "Mali": "ML", "Malta": "MT",
+    "Mauritania": "MR", "Mauritius": "MU", "Mexico": "MX", "Micronesia": "FM",
+    "Moldova": "MD", "Monaco": "MC", "Mongolia": "MN", "Montenegro": "ME",
+    "Morocco": "MA", "Mozambique": "MZ", "Myanmar": "MM", "Namibia": "NA",
+    "Nauru": "NR", "Nepal": "NP", "Netherlands": "NL", "Nicaragua": "NI",
+    "Niger": "NE", "Nigeria": "NG", "Norway": "NO", "Oman": "OM",
+    "Pakistan": "PK", "Palau": "PW", "Palestine": "PS", "Panama": "PA",
+    "Paraguay": "PY", "Peru": "PE", "Philippines": "PH", "Poland": "PL",
+    "Portugal": "PT", "Qatar": "QA", "Romania": "RO", "Russia": "RU",
+    "Rwanda": "RW", "Saint Lucia": "LC", "Samoa": "WS", "San Marino": "SM",
+    "Senegal": "SN", "Serbia": "RS", "Seychelles": "SC", "Singapore": "SG",
+    "Slovakia": "SK", "Slovenia": "SI", "Somalia": "SO", "Spain": "ES",
+    "Sudan": "SD", "Suriname": "SR", "Sweden": "SE", "Switzerland": "CH",
+    "Syria": "SY", "Taiwan": "TW", "Tajikistan": "TJ", "Tanzania": "TZ",
+    "Thailand": "TH", "Togo": "TG", "Tonga": "TO", "Tunisia": "TN",
+    "Turkey": "TR", "Turkmenistan": "TM", "Tuvalu": "TV", "Uganda": "UG",
+    "Ukraine": "UA", "Uruguay": "UY", "Uzbekistan": "UZ", "Vanuatu": "VU",
+    "Venezuela": "VE", "Vietnam": "VN", "Yemen": "YE", "Zambia": "ZM",
+    "Zimbabwe": "ZW", "Congo": "CG",
+}
+
+# Inverse: code -> canonical display name. Canonical long form wins when
+# two names share a code (so "United States of America" beats "United States").
+WHO_CODE_TO_NAME = {}
+for _nm, _cc in WHO_NAME_TO_CODE.items():
+    if _cc not in WHO_CODE_TO_NAME:
+        WHO_CODE_TO_NAME[_cc] = _nm
+
+
+def _extract_country_from_title(title: str) -> str:
+    """Find the first known country name appearing as a whole word in the title.
+    Returns canonical display form or '' if none matched. WHO_DON_COUNTRIES
+    ordering ensures multi-word names win over their components."""
+    if not title:
+        return ""
+    t = title.lower()
+    for needle, display in _WHO_DON_COUNTRIES_LC:
+        i = t.find(needle)
+        if i < 0:
+            continue
+        before_ok = (i == 0) or not t[i - 1].isalpha()
+        end = i + len(needle)
+        after_ok = (end == len(t)) or not t[end].isalpha()
+        if before_ok and after_ok:
+            return display
+    return ""
+
+
+def _strip_html(text: str) -> str:
+    """Strip tags, decode entities, collapse whitespace.
+    Used on WHO DON `Overview` field (HTML markup)."""
+    if not text:
+        return ""
+    out = re.sub(r"<[^>]+>", " ", text)
+    out = html_lib.unescape(out)
+    out = re.sub(r"\s+", " ", out)
+    return out.strip()
+
+
+def ingest_who_don() -> dict:
+    """Pull recent WHO Disease Outbreak News reports via OData v4. Upserts
+    into outbreaks (source='who_don'). Country parsed from title; ISO code
+    looked up via WHO_NAME_TO_CODE. Resilient: per-record errors skip,
+    cron never crashes."""
+    url = (WHO_DON_URL + "?$top=" + str(WHO_DON_FETCH_LIMIT) +
+           "&$orderby=PublicationDateAndTime%20desc")
+    inserted = 0
+    skipped = 0
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "CruiseShipWatch/1.0",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            data = json_lib.loads(raw)
+        except Exception as je:
+            print("[who_don] JSON parse failed: " + str(je))
+            return {"source": "who_don", "error": "json parse", "inserted": 0}
+        # OData v4 wraps the array under 'value'; fall back to bare array.
+        if isinstance(data, dict):
+            items = data.get("value")
+            if not isinstance(items, list):
+                items = []
+        elif isinstance(data, list):
+            items = data
+        else:
+            items = []
+        with get_db() as conn:
+            c = conn.cursor()
+            for rec in items:
+                if not isinstance(rec, dict):
+                    skipped = skipped + 1
+                    continue
+                don_id_raw = rec.get("DonId")
+                if isinstance(don_id_raw, str):
+                    don_id = don_id_raw.strip()
+                else:
+                    don_id = str(don_id_raw or "")
+                if not don_id:
+                    skipped = skipped + 1
+                    continue
+                oid = "who_don_" + don_id[:120]
+
+                # Title — prefer OverrideTitle only when explicitly flagged.
+                title = ""
+                if rec.get("UseOverrideTitle") and rec.get("OverrideTitle"):
+                    title = str(rec.get("OverrideTitle") or "").strip()
+                if not title:
+                    title = str(rec.get("Title") or "").strip()
+                if not title:
+                    skipped = skipped + 1
+                    continue
+
+                country = _extract_country_from_title(title)
+                country_code = WHO_NAME_TO_CODE.get(country, "")
+
+                pub = str(rec.get("PublicationDateAndTime") or
+                          rec.get("PublicationDate") or "").strip()
+                report_date = pub[:10] if len(pub) >= 10 else pub
+
+                url_name = str(rec.get("UrlName") or "").strip()
+                if url_name:
+                    report_url = "https://www.who.int/emergencies/disease-outbreak-news/item/" + url_name
+                else:
+                    report_url = "https://www.who.int/emergencies/disease-outbreak-news"
+
+                overview_html = str(rec.get("Overview") or rec.get("Summary") or "").strip()
+                summary = _strip_html(overview_html)[:500]
+
+                try:
+                    c.execute("""INSERT INTO outbreaks
+                        (source, outbreak_id, title, agent, location, country_code, region,
+                         report_date, report_url, summary, raw_json, fetched_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (outbreak_id) DO UPDATE SET
+                            title = EXCLUDED.title,
+                            agent = EXCLUDED.agent,
+                            location = EXCLUDED.location,
+                            country_code = EXCLUDED.country_code,
+                            region = EXCLUDED.region,
+                            report_date = EXCLUDED.report_date,
+                            report_url = EXCLUDED.report_url,
+                            summary = EXCLUDED.summary,
+                            fetched_at = EXCLUDED.fetched_at""",
+                        ("who_don", oid, title, title, country, country_code, country,
+                         report_date, report_url, summary, json_lib.dumps(rec),
+                         datetime.utcnow()))
+                    inserted = inserted + 1
+                except Exception as e:
+                    print("[who_don] skip " + oid + ": " + str(e))
+                    conn.rollback()
+                    c = conn.cursor()
+                    skipped = skipped + 1
+            conn.commit()
+        print("[who_don] fetched=" + str(len(items)) + " inserted=" + str(inserted) + " skipped=" + str(skipped))
+        return {"source": "who_don", "fetched": len(items), "inserted": inserted, "skipped": skipped}
+    except Exception as e:
+        print("[who_don] fetch error: " + str(e))
+        return {"source": "who_don", "error": str(e), "inserted": inserted}
+
+
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
 class UserCreate(BaseModel):
@@ -1544,6 +1829,56 @@ async def advisory_reconcile_all():
 
     threading.Thread(target=_do, daemon=True).start()
     return {"message": "Advisory reconcile started for all active watchlist ships"}
+
+
+# ── WHO DON admin endpoints (v0.1.8) ──────────────────────────────────────────
+
+@app.get("/admin/who-check-now")
+async def who_check_now():
+    """Manually trigger a WHO DON ingest pass."""
+    threading.Thread(target=ingest_who_don, daemon=True).start()
+    return {"message": "WHO DON ingest started"}
+
+
+@app.get("/admin/who-outbreaks")
+async def admin_list_who_outbreaks(country_code: Optional[str] = None, limit: int = 50):
+    """List cached WHO DON outbreaks, newest first. Optional country_code filter (ISO alpha-2)."""
+    with get_db() as conn:
+        c = conn.cursor()
+        if country_code:
+            c.execute("""SELECT id, outbreak_id, title, location, country_code, region,
+                report_date, report_url, summary, fetched_at
+                FROM outbreaks
+                WHERE source = 'who_don' AND country_code = %s
+                ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT %s""",
+                (country_code.upper(), limit))
+        else:
+            c.execute("""SELECT id, outbreak_id, title, location, country_code, region,
+                report_date, report_url, summary, fetched_at
+                FROM outbreaks
+                WHERE source = 'who_don'
+                ORDER BY report_date DESC NULLS LAST, fetched_at DESC LIMIT %s""",
+                (limit,))
+        rows = c.fetchall()
+        return {
+            "count": len(rows),
+            "country_code": country_code,
+            "outbreaks": [
+                {
+                    "id": r[0],
+                    "outbreak_id": r[1],
+                    "title": r[2],
+                    "location": r[3],
+                    "country_code": r[4],
+                    "region": r[5],
+                    "report_date": r[6],
+                    "report_url": r[7],
+                    "summary": r[8],
+                    "fetched_at": str(r[9]) if r[9] else None,
+                }
+                for r in rows
+            ],
+        }
 
 
 # ── Marine (NOAA High Seas Forecast) ──────────────────────────────────────────
@@ -2447,7 +2782,7 @@ def check_wikipedia_watchlist():
 
 def run_daily_cycle():
     """The combined daily check. State Dept first (cheap, single API call),
-    then NOAA marine forecasts, then Wikipedia (per-watchlist sweeps)."""
+    then NOAA marine forecasts, then WHO DON, then Wikipedia (per-watchlist sweeps)."""
     try:
         check_state_advisories()
     except Exception as e:
@@ -2456,6 +2791,10 @@ def run_daily_cycle():
         check_marine_forecasts()
     except Exception as e:
         print("[cron] check_marine_forecasts failed: " + str(e))
+    try:
+        ingest_who_don()
+    except Exception as e:
+        print("[cron] ingest_who_don failed: " + str(e))
     try:
         check_wikipedia_watchlist()
     except Exception as e:
@@ -2509,6 +2848,8 @@ async def startup_event():
     print("Initial State Dept advisory check started")
     threading.Thread(target=check_marine_forecasts, daemon=True).start()
     print("Initial NOAA marine forecast check started")
+    threading.Thread(target=ingest_who_don, daemon=True).start()
+    print("Initial WHO DON ingest started")
     threading.Thread(target=check_wikipedia_watchlist, daemon=True).start()
     print("Initial Wikipedia watchlist check started")
 

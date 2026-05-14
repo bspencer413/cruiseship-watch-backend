@@ -8,3 +8,5 @@ pydantic[email]
 requests
 schedule
 sqlalchemy
+httpx
+google-cloud-bigquery

@@ -30,7 +30,13 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@cruiseship.watch")
 
-VERSION = "0.1.8"
+# ── Travel Watch (TW) config ──────────────────────────────────────────────────
+# Separate JWT secret so tokens minted by TW cannot cross-validate against CW.
+TW_SECRET_KEY = os.environ.get("TW_JWT_SECRET", "travelwatch-fallback-key")
+TW_ACCESS_TOKEN_EXPIRE_MINUTES = 10080  # 7 days
+GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
+
+VERSION = "0.1.9"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -776,6 +782,49 @@ def init_db():
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_marine_regions ON marine_forecasts (regions)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_marine_state ON marine_forecasts (sea_state)")
+
+    # ── Travel Watch (TW) tables — v0.1.9 ─────────────────────────────────────
+    # TW cohosts on this Render service and reads from shared CW tables
+    # (advisories, outbreaks, marine_forecasts). It owns its own user, destination,
+    # and notification tables prefixed `tw_*` so namespaces never collide with CW.
+    c.execute("""CREATE TABLE IF NOT EXISTS tw_users (
+        id SERIAL PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tw_users_email ON tw_users (email)")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS tw_destinations (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES tw_users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        lat REAL NOT NULL,
+        lng REAL NOT NULL,
+        country TEXT,
+        country_code TEXT,
+        formatted_address TEXT,
+        radius_mi REAL DEFAULT 50,
+        alert_level TEXT DEFAULT 'realtime',
+        in_my_destinations BOOLEAN DEFAULT FALSE,
+        last_advisory_level INTEGER,
+        last_outbreak_count INTEGER DEFAULT 0,
+        last_checked_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tw_dest_user_id ON tw_destinations (user_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tw_dest_country_code ON tw_destinations (country_code)")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS tw_notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES tw_users(id) ON DELETE CASCADE,
+        watchlist_id INTEGER,
+        name TEXT,
+        message TEXT,
+        source TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tw_notifs_user_id ON tw_notifications (user_id)")
 
     conn.commit()
     conn.close()
@@ -1665,6 +1714,34 @@ class ObituaryResult(BaseModel):
     obit_text: Optional[str]
     confidence: str
 
+# ── Travel Watch (TW) models ──────────────────────────────────────────────────
+
+class TWUserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+class TWUserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class TWGeocodeQuery(BaseModel):
+    query: str
+
+class TWDestinationCreate(BaseModel):
+    name: str
+    lat: float
+    lng: float
+    country: Optional[str] = None
+    country_code: Optional[str] = None
+    formatted_address: Optional[str] = None
+    radius_mi: Optional[float] = 50.0
+    alert_level: Optional[str] = "realtime"
+
+class TWDestinationUpdate(BaseModel):
+    name: Optional[str] = None
+    radius_mi: Optional[float] = None
+    in_my_destinations: Optional[bool] = None
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Cruise Ship Watch API", version=VERSION)
@@ -1730,6 +1807,475 @@ def extract_location(text: str) -> Optional[str]:
     if match:
         return match.group(1)
     return None
+
+
+# ── Travel Watch (TW) subsystem — v0.1.9 ─────────────────────────────────────
+# TW cohosts on this Render service. It reads from shared `advisories`,
+# `outbreaks`, and `marine_forecasts` tables and owns its own `tw_*` tables.
+# Auth uses TW_SECRET_KEY (separate from CW's SECRET_KEY) so tokens never cross.
+
+tw_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="tw/auth/login")
+
+
+def tw_create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=TW_ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire, "app": "tw"})
+    return jwt.encode(to_encode, TW_SECRET_KEY, algorithm=ALGORITHM)
+
+
+def tw_get_current_user(token: str = Depends(tw_oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, TW_SECRET_KEY, algorithms=[ALGORITHM])
+        sub = payload.get("sub")
+        if sub is None:
+            raise HTTPException(status_code=401, detail="Invalid authentication")
+        return int(sub)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def tw_geocode_via_google(query: str) -> list:
+    """Forward-geocode a free-text query via Google Geocoding API.
+    Returns up to 5 candidate dicts with lat, lng, country, country_code,
+    formatted_address, and place_id. Empty list on missing key, empty query,
+    or any error — frontend treats empty as 'no matches'."""
+    if not GOOGLE_GEOCODING_API_KEY:
+        return []
+    if not query or not query.strip():
+        return []
+    try:
+        url = "https://maps.googleapis.com/maps/api/geocode/json"
+        params = {"address": query.strip(), "key": GOOGLE_GEOCODING_API_KEY}
+        with httpx.Client(timeout=10.0) as client:
+            r = client.get(url, params=params)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+        if data.get("status") not in ("OK", "ZERO_RESULTS"):
+            return []
+        out = []
+        for result in (data.get("results") or [])[:5]:
+            geom = (result.get("geometry") or {}).get("location") or {}
+            lat = geom.get("lat")
+            lng = geom.get("lng")
+            if lat is None or lng is None:
+                continue
+            country_name = None
+            country_code = None
+            for comp in result.get("address_components") or []:
+                if "country" in (comp.get("types") or []):
+                    country_name = comp.get("long_name")
+                    country_code = comp.get("short_name")  # ISO 3166-1 alpha-2
+                    break
+            out.append({
+                "place_id": result.get("place_id"),
+                "formatted_address": result.get("formatted_address"),
+                "lat": lat,
+                "lng": lng,
+                "country": country_name,
+                "country_code": country_code,
+            })
+        return out
+    except Exception as e:
+        print("[tw_geocode] error: " + str(e))
+        return []
+
+
+def tw_match_advisory_by_country(conn, country_name: Optional[str], country_code: Optional[str]) -> Optional[dict]:
+    """Find the State Dept advisory for a destination's country.
+    CW's `advisories` table is keyed by FIPS-style codes; TW destinations carry
+    ISO codes from Google. Bridging FIPS↔ISO is messy, so we match by
+    country_name (case-insensitive), which both systems agree on for ~95% of
+    countries ('France', 'Italy', 'Japan' are spelled the same in both)."""
+    if not country_name:
+        return None
+    c = conn.cursor()
+    c.execute("""
+        SELECT level, country_name, region, title, summary, url, published, updated
+        FROM advisories
+        WHERE LOWER(country_name) = LOWER(%s)
+        ORDER BY level DESC NULLS LAST, fetched_at DESC
+        LIMIT 1
+    """, (country_name,))
+    row = c.fetchone()
+    if not row:
+        return None
+    return {
+        "level": row[0],
+        "country_name": row[1],
+        "region": row[2],
+        "title": row[3],
+        "summary": row[4],
+        "url": row[5],
+        "published": row[6],
+        "updated": row[7],
+    }
+
+
+def tw_match_outbreaks_by_country(conn, country_code: Optional[str], days: int = 90, limit: int = 5) -> list:
+    """Pull recent WHO DON outbreaks for the destination's country.
+    ISO country_code matches directly since WHO DON stores ISO codes."""
+    if not country_code:
+        return []
+    c = conn.cursor()
+    c.execute("""
+        SELECT outbreak_id, title, country_code, region, report_date, report_url, summary
+        FROM outbreaks
+        WHERE source = 'who_don'
+          AND country_code = %s
+        ORDER BY report_date DESC NULLS LAST, fetched_at DESC
+        LIMIT %s
+    """, (country_code.upper(), limit))
+    rows = c.fetchall() or []
+    out = []
+    for r in rows:
+        out.append({
+            "outbreak_id": r[0],
+            "title": r[1],
+            "country_code": r[2],
+            "region": r[3],
+            "report_date": r[4],
+            "report_url": r[5],
+            "summary": r[6],
+        })
+    return out
+
+
+# ISO codes for countries with coast/cruise relevance. Destinations in one of these
+# countries get a marine-conditions card in the drawer. Inland-only countries skip it.
+TW_COASTAL_ISO_COUNTRIES = {
+    "US","CA","MX","CU","BS","JM","DO","HT","PR","VI","BB","TT","BZ",
+    "GT","HN","NI","CR","PA","CO","VE","BR","UY","AR","CL","EC","PE",
+    "GB","IE","FR","ES","PT","IT","GR","HR","MT","CY","TR","NO","SE",
+    "DK","NL","BE","DE","FI","EE","LV","LT","PL","RU","UA","BG","RO",
+    "MA","EG","TN","LY","DZ","ZA","NA","AO","KE","TZ","MZ","MG","MU",
+    "SC","JP","KR","CN","HK","TW","PH","VN","TH","MY","SG","ID","BN",
+    "AU","NZ","FJ","PG","SB","WS","TO","PF","NC","VU","KI","TV",
+    "IS","GL","FO","AE","OM","SA","QA","BH","KW","YE","IR","IQ",
+    "GE","BD","IN","LK","MV","MM",
+}
+
+
+def tw_match_marine_for_destination(conn, lat: float, lng: float, country_code: Optional[str]) -> list:
+    """For coastal destinations, attach the most severe current marine forecast.
+    For v1 this is the worst sea_state currently on file in CW's marine_forecasts;
+    point-in-polygon matching against NOAA HSF zones would require PostGIS
+    and is deferred. Coverage is global enough for cruise destinations."""
+    if not country_code or country_code.upper() not in TW_COASTAL_ISO_COUNTRIES:
+        return []
+    c = conn.cursor()
+    c.execute("""
+        SELECT area_code, area_name, regions, max_wave_m, sea_state, source_url, issued_at
+        FROM marine_forecasts
+        WHERE sea_state IS NOT NULL
+        ORDER BY CASE sea_state
+            WHEN 'rough' THEN 3
+            WHEN 'moderate' THEN 2
+            WHEN 'calm' THEN 1
+            ELSE 0
+        END DESC, max_wave_m DESC NULLS LAST, fetched_at DESC
+        LIMIT 1
+    """)
+    row = c.fetchone()
+    if not row:
+        return []
+    return [{
+        "area_code": row[0],
+        "area_name": row[1],
+        "regions": row[2],
+        "max_wave_m": row[3],
+        "sea_state": row[4],
+        "source_url": row[5],
+        "issued_at": row[6],
+    }]
+
+
+def tw_build_static_map_url(lat: float, lng: float, radius_mi: float) -> Optional[str]:
+    """Google Static Maps URL used as a drawer preview thumbnail.
+    Zoom adapts to radius: smaller radius → tighter zoom."""
+    if not GOOGLE_GEOCODING_API_KEY:
+        return None
+    try:
+        zoom = 9
+        if radius_mi >= 200: zoom = 6
+        elif radius_mi >= 100: zoom = 7
+        elif radius_mi >= 50: zoom = 8
+        url = ("https://maps.googleapis.com/maps/api/staticmap"
+               + "?center=" + str(lat) + "," + str(lng)
+               + "&zoom=" + str(zoom)
+               + "&size=600x300"
+               + "&scale=2"
+               + "&maptype=roadmap"
+               + "&markers=color:orange|" + str(lat) + "," + str(lng)
+               + "&key=" + GOOGLE_GEOCODING_API_KEY)
+        return url
+    except Exception:
+        return None
+
+
+# ── TW endpoints ──────────────────────────────────────────────────────────────
+
+@app.post("/tw/auth/register", response_model=Token)
+async def tw_register(user: TWUserCreate):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id FROM tw_users WHERE email = %s", (user.email,))
+        if c.fetchone():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        hashed = hash_password(user.password)
+        c.execute("INSERT INTO tw_users (email, password_hash) VALUES (%s, %s) RETURNING id",
+                  (user.email, hashed))
+        new_id = c.fetchone()[0]
+        conn.commit()
+        token = tw_create_access_token({"sub": str(new_id)})
+        return {"access_token": token, "token_type": "bearer"}
+
+
+@app.post("/tw/auth/login", response_model=Token)
+async def tw_login(user: TWUserLogin):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, password_hash FROM tw_users WHERE email = %s", (user.email,))
+        row = c.fetchone()
+        if not row or not verify_password(user.password, row[1]):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        token = tw_create_access_token({"sub": str(row[0])})
+        return {"access_token": token, "token_type": "bearer"}
+
+
+@app.delete("/tw/account")
+async def tw_delete_account(user_id: int = Depends(tw_get_current_user)):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM tw_notifications WHERE user_id = %s", (user_id,))
+        c.execute("DELETE FROM tw_destinations WHERE user_id = %s", (user_id,))
+        c.execute("DELETE FROM tw_users WHERE id = %s", (user_id,))
+        conn.commit()
+    return {"message": "Account deleted"}
+
+
+@app.post("/tw/geocode")
+async def tw_geocode(q: TWGeocodeQuery, user_id: int = Depends(tw_get_current_user)):
+    if not GOOGLE_GEOCODING_API_KEY:
+        raise HTTPException(status_code=503, detail="Geocoding service not configured")
+    cands = tw_geocode_via_google(q.query)
+    return {"candidates": cands}
+
+
+@app.get("/tw/destinations")
+async def tw_list_destinations(user_id: int = Depends(tw_get_current_user)):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, name, lat, lng, country, country_code, formatted_address,
+                   radius_mi, alert_level, in_my_destinations, created_at,
+                   last_advisory_level, last_outbreak_count, last_checked_at
+            FROM tw_destinations
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        """, (user_id,))
+        rows = c.fetchall() or []
+        out = []
+        for r in rows:
+            out.append({
+                "id": r[0], "name": r[1], "lat": r[2], "lng": r[3],
+                "country": r[4], "country_code": r[5], "formatted_address": r[6],
+                "radius_mi": r[7], "alert_level": r[8],
+                "in_my_destinations": bool(r[9]),
+                "created_at": r[10].isoformat() if r[10] else None,
+                "last_advisory_level": r[11], "last_outbreak_count": r[12],
+                "last_checked_at": r[13].isoformat() if r[13] else None,
+            })
+        return out
+
+
+@app.post("/tw/destinations")
+async def tw_add_destination(dest: TWDestinationCreate, user_id: int = Depends(tw_get_current_user)):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO tw_destinations (user_id, name, lat, lng, country, country_code,
+                                         formatted_address, radius_mi, alert_level)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (user_id, dest.name, dest.lat, dest.lng, dest.country, dest.country_code,
+              dest.formatted_address, dest.radius_mi or 50.0, dest.alert_level or "realtime"))
+        new_id = c.fetchone()[0]
+        conn.commit()
+    return {"id": new_id, "message": "Destination added"}
+
+
+@app.patch("/tw/destinations/{dest_id}")
+async def tw_update_destination(dest_id: int, update: TWDestinationUpdate,
+                                user_id: int = Depends(tw_get_current_user)):
+    sets = []
+    args = []
+    if update.name is not None:
+        sets.append("name = %s")
+        args.append(update.name)
+    if update.radius_mi is not None:
+        sets.append("radius_mi = %s")
+        args.append(update.radius_mi)
+    if update.in_my_destinations is not None:
+        sets.append("in_my_destinations = %s")
+        args.append(bool(update.in_my_destinations))
+    if not sets:
+        return {"message": "No changes"}
+    args.append(dest_id)
+    args.append(user_id)
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE tw_destinations SET " + ", ".join(sets)
+                  + " WHERE id = %s AND user_id = %s", tuple(args))
+        conn.commit()
+    return {"message": "Destination updated"}
+
+
+@app.delete("/tw/destinations/{dest_id}")
+async def tw_remove_destination(dest_id: int, user_id: int = Depends(tw_get_current_user)):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM tw_destinations WHERE id = %s AND user_id = %s",
+                  (dest_id, user_id))
+        conn.commit()
+    return {"message": "Destination removed"}
+
+
+@app.get("/tw/destinations/{dest_id}/signals")
+async def tw_get_destination_signals(dest_id: int, user_id: int = Depends(tw_get_current_user)):
+    """LIVE drawer payload — re-queries shared CW tables for current signals.
+    Returns advisory + outbreaks + marine + a static map URL. Updates the
+    destination's last_seen snapshot as a side effect, so cron can diff later."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, name, lat, lng, country, country_code, formatted_address,
+                   radius_mi, in_my_destinations
+            FROM tw_destinations
+            WHERE id = %s AND user_id = %s
+        """, (dest_id, user_id))
+        row = c.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Destination not found")
+        dest = {
+            "id": row[0], "name": row[1], "lat": row[2], "lng": row[3],
+            "country": row[4], "country_code": row[5],
+            "formatted_address": row[6], "radius_mi": row[7],
+            "in_my_destinations": bool(row[8]),
+        }
+        advisory = tw_match_advisory_by_country(conn, dest["country"], dest["country_code"])
+        outbreaks = tw_match_outbreaks_by_country(conn, dest["country_code"])
+        marine = tw_match_marine_for_destination(conn, dest["lat"], dest["lng"], dest["country_code"])
+        try:
+            adv_level = advisory["level"] if advisory else None
+            outbreak_count = len(outbreaks)
+            c.execute("""
+                UPDATE tw_destinations
+                SET last_advisory_level = %s, last_outbreak_count = %s, last_checked_at = NOW()
+                WHERE id = %s
+            """, (adv_level, outbreak_count, dest_id))
+            conn.commit()
+        except Exception as _e:
+            conn.rollback()
+    static_map_url = tw_build_static_map_url(dest["lat"], dest["lng"], dest["radius_mi"] or 50.0)
+    return {
+        "destination": dest,
+        "advisory": advisory,
+        "outbreaks": outbreaks,
+        "marine": marine,
+        "static_map_url": static_map_url,
+    }
+
+
+@app.get("/tw/notifications")
+async def tw_list_notifications(user_id: int = Depends(tw_get_current_user)):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, watchlist_id, name, message, source, created_at
+            FROM tw_notifications
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT 200
+        """, (user_id,))
+        rows = c.fetchall() or []
+        out = []
+        for r in rows:
+            out.append({
+                "id": r[0], "watchlist_id": r[1], "name": r[2],
+                "message": r[3], "source": r[4],
+                "created_at": r[5].isoformat() if r[5] else None,
+            })
+        return out
+
+
+@app.delete("/tw/notifications/{notif_id}")
+async def tw_delete_notification(notif_id: int, user_id: int = Depends(tw_get_current_user)):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM tw_notifications WHERE id = %s AND user_id = %s",
+                  (notif_id, user_id))
+        conn.commit()
+    return {"message": "Notification deleted"}
+
+
+# ── TW cron reconcile ─────────────────────────────────────────────────────────
+
+def tw_reconcile_destinations():
+    """Daily sweep — re-checks each TW destination's country against shared tables.
+    Fires a tw_notification when:
+      • advisory level rises above last_advisory_level
+      • outbreak count rises above last_outbreak_count
+    Then updates the snapshot. No notifications fire on first run since baseline
+    fields seed from the drawer's live check."""
+    print("[tw_cron] reconciling destinations...")
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, user_id, name, lat, lng, country, country_code,
+                       radius_mi, last_advisory_level, last_outbreak_count
+                FROM tw_destinations
+            """)
+            rows = c.fetchall() or []
+            fired = 0
+            for r in rows:
+                d_id, u_id, name, lat, lng, country, cc, radius, last_lvl, last_cnt = r
+                advisory = tw_match_advisory_by_country(conn, country, cc)
+                outbreaks = tw_match_outbreaks_by_country(conn, cc)
+                cur_lvl = advisory["level"] if advisory else None
+                cur_cnt = len(outbreaks)
+                if cur_lvl is not None and last_lvl is not None and cur_lvl > last_lvl:
+                    c.execute("""
+                        INSERT INTO tw_notifications (user_id, watchlist_id, name, message, source)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (u_id, d_id, name,
+                          "Travel advisory raised to Level " + str(cur_lvl)
+                          + ((" for " + advisory.get("country_name")) if advisory.get("country_name") else ""),
+                          "state_dept"))
+                    fired += 1
+                if last_cnt is not None and cur_cnt > last_cnt:
+                    delta = cur_cnt - last_cnt
+                    c.execute("""
+                        INSERT INTO tw_notifications (user_id, watchlist_id, name, message, source)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (u_id, d_id, name,
+                          str(delta) + " new health outbreak"
+                          + ("s" if delta != 1 else "") + " reported by WHO",
+                          "who_don"))
+                    fired += 1
+                c.execute("""
+                    UPDATE tw_destinations
+                    SET last_advisory_level = %s, last_outbreak_count = %s, last_checked_at = NOW()
+                    WHERE id = %s
+                """, (cur_lvl, cur_cnt, d_id))
+            conn.commit()
+            print("[tw_cron] reconciled " + str(len(rows)) + " destinations, fired " + str(fired) + " alerts")
+    except Exception as e:
+        print("[tw_cron] failed: " + str(e))
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
@@ -2795,6 +3341,10 @@ def run_daily_cycle():
         ingest_who_don()
     except Exception as e:
         print("[cron] ingest_who_don failed: " + str(e))
+    try:
+        tw_reconcile_destinations()
+    except Exception as e:
+        print("[cron] tw_reconcile_destinations failed: " + str(e))
     try:
         check_wikipedia_watchlist()
     except Exception as e:

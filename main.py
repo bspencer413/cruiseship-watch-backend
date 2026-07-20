@@ -2058,7 +2058,9 @@ async def tw_delete_account(user_id: int = Depends(tw_get_current_user)):
 
 
 @app.post("/tw/geocode")
-async def tw_geocode(q: TWGeocodeQuery, user_id: int = Depends(tw_get_current_user)):
+# v: public route — anon users must geocode/preview before signup. Save is the
+# auth trigger. user_id was unused in the body.
+async def tw_geocode(q: TWGeocodeQuery):
     if not GOOGLE_GEOCODING_API_KEY:
         raise HTTPException(status_code=503, detail="Geocoding service not configured")
     cands = tw_geocode_via_google(q.query)

@@ -1959,6 +1959,32 @@ TW_COASTAL_ISO_COUNTRIES = {
 }
 
 
+def _tw_basin_for_coords(lat, lng):
+    """Rough ocean-basin assignment by coordinates so a destination gets the
+    marine forecast for ITS ocean, not the worst sea_state on file anywhere.
+    Coarse bounding boxes -- enough to stop inland/Atlantic sites getting a
+    Pacific bulletin. Returns an HSF area_code or None."""
+    if lat is None or lng is None:
+        return None
+    if lat >= 52 and (lng <= -128 or lng >= 160):
+        return "HSFNP_AK"
+    if 20 <= lng <= 100 and -50 <= lat <= 32:
+        return "HSFIO"
+    if 100 <= lng <= 170 and -10 <= lat <= 55:
+        return "HSFAS"
+    if (lng >= 160 or lng <= -140) and -50 <= lat <= 32:
+        return "HSFNP_HAWAII"
+    if -170 <= lng <= -115 and 25 <= lat <= 60:
+        return "HSFNP"
+    if -130 <= lng <= -78 and -20 <= lat < 25:
+        return "HSFEP2"
+    if -100 <= lng <= -30 and -60 <= lat <= 27:
+        return "HSFAT2"
+    if -80 <= lng <= 42 and 5 <= lat <= 75:
+        return "HSFNT1"
+    return None
+
+
 def tw_match_marine_for_destination(conn, lat: float, lng: float, country_code: Optional[str]) -> list:
     """For coastal destinations, attach the most severe current marine forecast.
     For v1 this is the worst sea_state currently on file in CW's marine_forecasts;
@@ -1966,19 +1992,20 @@ def tw_match_marine_for_destination(conn, lat: float, lng: float, country_code: 
     and is deferred. Coverage is global enough for cruise destinations."""
     if not country_code or country_code.upper() not in TW_COASTAL_ISO_COUNTRIES:
         return []
+    # v: match the destination's OWN ocean basin by coordinates, instead of the
+    # worst sea_state on file anywhere (which put Pacific warnings on Atlantic
+    # and inland-adjacent sites). No basin match -> no marine card.
+    area = _tw_basin_for_coords(lat, lng)
+    if not area:
+        return []
     c = conn.cursor()
     c.execute("""
         SELECT area_code, area_name, regions, max_wave_m, sea_state, source_url, issued_at
         FROM marine_forecasts
-        WHERE sea_state IS NOT NULL
-        ORDER BY CASE sea_state
-            WHEN 'rough' THEN 3
-            WHEN 'moderate' THEN 2
-            WHEN 'calm' THEN 1
-            ELSE 0
-        END DESC, max_wave_m DESC NULLS LAST, fetched_at DESC
+        WHERE area_code = %s AND sea_state IS NOT NULL
+        ORDER BY fetched_at DESC
         LIMIT 1
-    """)
+    """, (area,))
     row = c.fetchone()
     if not row:
         return []
@@ -2058,9 +2085,7 @@ async def tw_delete_account(user_id: int = Depends(tw_get_current_user)):
 
 
 @app.post("/tw/geocode")
-# v: public route — anon users must geocode/preview before signup. Save is the
-# auth trigger. user_id was unused in the body.
-async def tw_geocode(q: TWGeocodeQuery):
+async def tw_geocode(q: TWGeocodeQuery, user_id: int = Depends(tw_get_current_user)):
     if not GOOGLE_GEOCODING_API_KEY:
         raise HTTPException(status_code=503, detail="Geocoding service not configured")
     cands = tw_geocode_via_google(q.query)
